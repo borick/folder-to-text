@@ -87,31 +87,16 @@ This Python script (`folder_to_text.py`) processes a folder containing source co
 
 2.  **Recommended for Max Reduction:** Apply block compression, line minification, definition cleanup, and post-cleanup. Good for maximizing compression for LLM context.
 
-    python folder_to_text.py /path/to/project \
-        --skip-empty \
-        --skip-duplicates \
-        --preprocess-split-lines \
-        --compress-patterns --min-consecutive 3 \
-        --minify-lines --min-line-length 40 --min-repetitions 2 \
-        --post-cleanup \
-        -o max_compressed_cleaned.txt
+    python folder_to_text.py /path/to/project --skip-empty --skip-duplicates --preprocess-split-lines --compress-patterns --min-consecutive 3 --minify-lines --min-line-length 40 --min-repetitions 2 --post-cleanup
+    -o max_compressed_cleaned.txt
 
 3.  **Alternative Reduction (Apply Patterns):** Use detailed pattern application instead of block/line compression, followed by cleanup. Might be better if preserving line structure is more important than block compression.
 
-    python folder_to_text.py /path/to/project \
-        --skip-empty \
-        --skip-duplicates \
-        --apply-patterns \
-        --post-cleanup \
-        -o applied_cleaned.txt
+    python folder_to_text.py /path/to/project --skip-empty --skip-duplicates --apply-patterns --post-cleanup -o applied_cleaned.txt
 
 4.  **Debugging Post-Cleanup:** Run with pattern application and post-cleanup, enabling DEBUG logging to see exactly which lines are being removed by the cleanup step. Log messages go to stderr, redirect stderr to a file (`debug.log`).
 
-    python folder_to_text.py /path/to/project \
-        --apply-patterns \
-        --post-cleanup \
-        --log-level DEBUG \
-        -o debug_run.txt 2> debug.log
+    python folder_to_text.py /path/to/project --apply-patterns --post-cleanup --log-level DEBUG -o debug_run.txt 2> debug.log
 
 ## How it Works (Processing Pipeline)
 
