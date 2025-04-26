@@ -166,9 +166,7 @@ Advanced users can modify these directly within the script to customize its beha
 
 ## License
 
-[Specify Your License Here - e.g., MIT License]
-
-*If you haven't chosen a license, MIT is a common permissive choice. You would need to add a separate `LICENSE` file containing the actual MIT license text.*
+[MIT License](LICENSE)
 
 ## Contributing
 
