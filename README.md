@@ -34,7 +34,7 @@ This Python script (`folder_to_text.py`) processes a folder containing source co
 
 ## Usage
 
-    python folder_to_text.py <folder_path> [options]
+```python folder_to_text.py <folder_path> [options]```
 
 ---
 
@@ -82,21 +82,20 @@ This Python script (`folder_to_text.py`) processes a folder containing source co
 
 1.  **Basic Simplification:** Process a project, skip empty/duplicate files, and output to `simple.txt`.
 
-    python folder_to_text.py /path/to/project --skip-empty --skip-duplicates -o simple.txt
+```python folder_to_text.py /path/to/project --skip-empty --skip-duplicates -o simple.txt```
 
 
 2.  **Recommended for Max Reduction:** Apply block compression, line minification, definition cleanup, and post-cleanup. Good for maximizing compression for LLM context.
 
-    python folder_to_text.py /path/to/project --skip-empty --skip-duplicates --preprocess-split-lines --compress-patterns --min-consecutive 3 --minify-lines --min-line-length 40 --min-repetitions 2 --post-cleanup
-    -o max_compressed_cleaned.txt
+```python folder_to_text.py /path/to/project --skip-empty --skip-duplicates --preprocess-split-lines --compress-patterns --min-consecutive 3 --minify-lines --min-line-length 40 --min-repetitions 2 --post-cleanup -o max_compressed_cleaned.txt```
 
 3.  **Alternative Reduction (Apply Patterns):** Use detailed pattern application instead of block/line compression, followed by cleanup. Might be better if preserving line structure is more important than block compression.
 
-    python folder_to_text.py /path/to/project --skip-empty --skip-duplicates --apply-patterns --post-cleanup -o applied_cleaned.txt
+```python folder_to_text.py /path/to/project --skip-empty --skip-duplicates --apply-patterns --post-cleanup -o applied_cleaned.txt```
 
 4.  **Debugging Post-Cleanup:** Run with pattern application and post-cleanup, enabling DEBUG logging to see exactly which lines are being removed by the cleanup step. Log messages go to stderr, redirect stderr to a file (`debug.log`).
 
-    python folder_to_text.py /path/to/project --apply-patterns --post-cleanup --log-level DEBUG -o debug_run.txt 2> debug.log
+```python folder_to_text.py /path/to/project --apply-patterns --post-cleanup --log-level DEBUG -o debug_run.txt 2> debug.log
 
 ## How it Works (Processing Pipeline)
 
@@ -111,8 +110,8 @@ The script processes the folder in several stages:
     *   Separates files into "source" (based on `CODE_EXTENSIONS`) and "other".
 3.  **Source File Processing (`simplify_source_code` within `process_folder`):**
     *   Reads the file content.
-    *   Removes comments (`/* */`, `//`, `#`, etc.).
-    *   Removes docstrings (`""" ""`, `''' '''`).
+    *   Removes comments
+    *   Removes docstrings
     *   (Optional) Removes logging lines (`--strip-logging`).
     *   Applies basic simplification patterns (`SIMPLIFICATION_PATTERNS` - numbers, hex, base64).
     *   (Optional, unless `--compress-patterns`) Compresses large list/dict literals (`--large-literal-threshold`).
