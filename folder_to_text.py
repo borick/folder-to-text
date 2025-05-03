@@ -3,7 +3,7 @@
 # --- folder_to_text.py ---
 # Processes a folder, simplifying text files, summarizing others,
 # and compresses repetitive patterns or lines using recommended settings by default,
-# with a final cleanup step. Includes a raw dump mode.
+# with a final cleanup step. Includes a raw dump mode and file type reporting.
 
 # --- Example Usage ---
 
@@ -336,10 +336,12 @@ def process_folder(
     strip_logging: bool,
     skip_duplicates: bool,
     large_literal_threshold: int,
-    compress_patterns_enabled: bool
+    compress_patterns_enabled: bool,
+    report_data: Dict[str, Counter] # <<< ADDED: Pass the report dictionary
 ):
     """
     Processes the folder using simplification, filtering, etc. (Standard Mode).
+    Populates the report_data dictionary with file type statistics. # <<< ADDED: Docstring update
     """
     global seen_content_hashes
     target_path = Path(target_folder).resolve()
@@ -410,48 +412,77 @@ def process_folder(
 
             for rel_path, full_path, file_ext in source_files_to_process:
                 file_info_prefix = f"--- File: {rel_path}"
+                # <<< ADDED: Determine file identifier for reporting >>>
+                file_id_for_report = file_ext if file_ext else rel_path.name
+
+                # <<< ADDED: Initialize counter for this file type if needed >>>
+                if file_id_for_report not in report_data:
+                    report_data[file_id_for_report] = Counter()
+
+                # <<< ADDED: Increment processed count >>>
+                report_data[file_id_for_report]['processed'] += 1
+
                 try:
                     log.debug(f"Processing source file: {rel_path}")
                     with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
 
+                    # <<< ADDED: Get hash *before* simplification for comparison >>>
+                    hash_before = hashlib.sha256(content.encode('utf-8')).hexdigest()
+
                     simplified_content = simplify_source_code(
                         content,
                         strip_logging,
                         large_literal_threshold,
-                        disable_literal_compression=compress_patterns_enabled # Pass the flag
+                        disable_literal_compression=compress_patterns_enabled
                     )
 
+                    # <<< ADDED: Get hash *after* simplification >>>
+                    hash_after = hashlib.sha256(simplified_content.encode('utf-8')).hexdigest()
+                    is_simplified = hash_before != hash_after # Check if content actually changed
+
                     is_empty_after_simplification = not simplified_content.strip()
-                    content_hash = None
+                    content_hash = hash_after # Use the hash of simplified content for duplication check
                     is_duplicate = False
+
+                    # <<< ADDED: Track simplification >>>
+                    if is_simplified and not is_empty_after_simplification:
+                         report_data[file_id_for_report]['simplified'] += 1
 
                     # Check if skipping empty files
                     if skip_empty and is_empty_after_simplification:
                         log.info(f"Skipping empty file (after simplification): {rel_path}")
+                        # <<< ADDED: Track skipped empty >>>
+                        report_data[file_id_for_report]['skipped_empty'] += 1
                         continue # Skip to next file
 
                     # Check for duplicates if enabled and file is not empty
                     if skip_duplicates and not is_empty_after_simplification:
-                        content_hash = hashlib.sha256(simplified_content.encode('utf-8')).hexdigest()
+                        # content_hash = hashlib.sha256(simplified_content.encode('utf-8')).hexdigest() # Already calculated above
                         if content_hash in seen_content_hashes:
                             is_duplicate = True
                             log.info(f"Skipping duplicate content file: {rel_path} (Hash: {content_hash[:8]}...)")
+                            # <<< ADDED: Track skipped duplicate >>>
+                            report_data[file_id_for_report]['skipped_duplicate'] += 1
                             continue # Skip to next file
                         else:
-                             # Only add hash if skip_duplicates is enabled and it's not a duplicate
                              seen_content_hashes.add(content_hash)
                              log.debug(f"Adding new content hash: {content_hash[:8]}... for {rel_path}")
 
+                    # <<< ADDED: If we reached here, the file's content was included (or would be if not empty/dup)
+                    #             and potentially subject to post-processing.
+                    report_data[file_id_for_report]['contributed'] += 1
 
                     # Write file header
                     write_to_buffer(file_info_prefix + " ---")
 
                     # Write content or empty message
                     if is_empty_after_simplification:
+                        # Even if kept (--keep-empty), mark it as contributing 0 content size effectively
                         write_to_buffer("# (File is empty or contained only comments/whitespace/logging)")
                     else:
                         write_to_buffer(simplified_content.strip())
+
 
                     # Write file footer
                     write_to_buffer(f"--- End File: {rel_path} ---")
@@ -997,6 +1028,9 @@ def main():
     logging.getLogger().setLevel(args.log_level.upper()) # Ensure root logger level is also set
     seen_content_hashes.clear() # Ensure fresh state for each run
     total_bytes_written = 0
+    # <<< ADDED: Initialize report data dictionary >>>
+    file_type_report_data: Dict[str, Counter] = {}
+
 
     target_folder_path = Path(args.folder_path)
     if not target_folder_path.is_dir():
@@ -1080,7 +1114,8 @@ def main():
                 strip_logging=args.strip_logging,
                 skip_duplicates=effective_skip_duplicates,
                 large_literal_threshold=args.large_literal_threshold,
-                compress_patterns_enabled=args.compress_patterns
+                compress_patterns_enabled=args.compress_patterns,
+                report_data=file_type_report_data # <<< ADDED: Pass the dictionary
             )
             log.info("Finished initial folder processing.")
 
@@ -1168,13 +1203,75 @@ def main():
         print("-" * 40, file=sys.stderr)
         print("Processing complete.", file=sys.stderr)
         print(f"Mode: {'RAW DUMP' if args.raw_dump else 'Standard'}", file=sys.stderr)
-        if not args.raw_dump:
-             if args.preprocess_split_lines: print(f"  Line expansion pre-processing expanded {num_lines_expanded} lines.", file=sys.stderr)
-             if args.compress_patterns: print(f"  Pattern block compression created {num_blocks_compressed} summary lines.", file=sys.stderr)
-             if args.apply_patterns: print(f"  Detailed pattern application made {num_pattern_replacements} replacements.", file=sys.stderr)
-             if args.minify_lines: print(f"  Identical line minification replaced {num_lines_minified} line occurrences.", file=sys.stderr)
-             if args.post_cleanup: print(f"  Post-processing cleanup removed {num_lines_cleaned_up} lines.", file=sys.stderr)
 
+        if not args.raw_dump:
+             # <<< ADDED: Detailed Post-Processing Summary >>>
+             print("\n--- Overall Post-Processing Stage Summary ---", file=sys.stderr)
+             if args.preprocess_split_lines: print(f"  Line expansion pre-processing expanded {num_lines_expanded} lines.", file=sys.stderr)
+             else: print("  Line expansion pre-processing: Skipped/Disabled", file=sys.stderr)
+
+             if args.compress_patterns: print(f"  Pattern block compression created {num_blocks_compressed} summary lines.", file=sys.stderr)
+             else: print("  Pattern block compression: Skipped/Disabled", file=sys.stderr)
+
+             if args.apply_patterns: print(f"  Detailed pattern application made {num_pattern_replacements} replacements.", file=sys.stderr)
+             else: print("  Detailed pattern application: Skipped/Disabled", file=sys.stderr)
+
+             if args.minify_lines: print(f"  Identical line minification replaced {num_lines_minified} line occurrences.", file=sys.stderr)
+             else: print("  Identical line minification: Skipped/Disabled", file=sys.stderr)
+
+             if args.post_cleanup: print(f"  Post-processing cleanup removed {num_lines_cleaned_up} lines.", file=sys.stderr)
+             else: print("  Post-processing cleanup: Skipped/Disabled", file=sys.stderr)
+
+             # <<< ADDED: File Type Processing Report >>>
+             print("\n--- File Type Processing Report ---", file=sys.stderr)
+             if not file_type_report_data:
+                 print("  No source files were processed or met inclusion criteria.", file=sys.stderr)
+             else:
+                 # Sort by file type identifier for consistent output
+                 sorted_file_ids = sorted(file_type_report_data.keys())
+                 total_processed = 0
+                 total_simplified = 0
+                 total_skipped_empty = 0
+                 total_skipped_duplicate = 0
+                 total_contributed = 0
+                 for file_id in sorted_file_ids:
+                     stats = file_type_report_data[file_id]
+                     processed_count = stats.get('processed', 0)
+                     simplified_count = stats.get('simplified', 0)
+                     skipped_empty_count = stats.get('skipped_empty', 0)
+                     skipped_duplicate_count = stats.get('skipped_duplicate', 0)
+                     contributed_count = stats.get('contributed', 0)
+
+                     # Accumulate totals
+                     total_processed += processed_count
+                     total_simplified += simplified_count
+                     total_skipped_empty += skipped_empty_count
+                     total_skipped_duplicate += skipped_duplicate_count
+                     total_contributed += contributed_count
+
+                     print(f"  {file_id if file_id else '<no_ext>'}:", file=sys.stderr) # Handle empty extension case
+                     print(f"    - Processed: {processed_count}", file=sys.stderr)
+                     # Only show categories if they occurred for this type
+                     if simplified_count > 0:
+                         print(f"    - Simplified (Initial): {simplified_count}", file=sys.stderr)
+                     if skipped_empty_count > 0:
+                         print(f"    - Skipped (Empty): {skipped_empty_count}", file=sys.stderr)
+                     if skipped_duplicate_count > 0:
+                         print(f"    - Skipped (Duplicate): {skipped_duplicate_count}", file=sys.stderr)
+                     if contributed_count > 0:
+                          print(f"    - Contributed Content: {contributed_count}", file=sys.stderr)
+                 # Print Totals
+                 print("  ---", file=sys.stderr)
+                 print(f"  TOTALS:", file=sys.stderr)
+                 print(f"    - Processed: {total_processed}", file=sys.stderr)
+                 print(f"    - Simplified (Initial): {total_simplified}", file=sys.stderr)
+                 print(f"    - Skipped (Empty): {total_skipped_empty}", file=sys.stderr)
+                 print(f"    - Skipped (Duplicate): {total_skipped_duplicate}", file=sys.stderr)
+                 print(f"    - Contributed Content: {total_contributed}", file=sys.stderr)
+
+
+        # <<< MODIFIED: Moved byte count output below reports >>>
+        print("-" * 40, file=sys.stderr) # Separator before final size
         if args.output and output_path: print(f"Total bytes written to {output_path}: {total_bytes_written}", file=sys.stderr)
         else: print(f"Total bytes written to stdout: {total_bytes_written}", file=sys.stderr)
         print("-" * 40, file=sys.stderr)
