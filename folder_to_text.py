@@ -1,27 +1,8 @@
 #!/usr/bin/env python3
 
 # --- folder_to_text.py ---
-# Processes a folder, simplifying text files, summarizing others,
-# and compresses repetitive patterns or lines using recommended settings by default,
-# with a final cleanup step. Includes a raw dump mode.
-
-# --- Example Usage ---
-
-# 1. Default (Max Reduction - Recommended):
-#    python folder_to_text.py /path/to/project -o max_compressed_cleaned.txt
-
-# 2. Raw Dump (Concatenate all files verbatim):
-#    python folder_to_text.py /path/to/project --raw-dump -o raw_dump.txt
-
-# 3. Basic Simplification (Disable most compression/cleanup):
-#    python folder_to_text.py /path/to/project --keep-empty --keep-duplicates --no-preprocess-split-lines --no-compress-patterns --no-minify-lines --no-post-cleanup -o basic_simple.txt
-
-# 4. Using --apply-patterns (Disable block/line, enable apply, keep cleanup):
-#    python folder_to_text.py /path/to/project --no-compress-patterns --no-minify-lines --apply-patterns -o applied_cleaned.txt
-
-# 5. Debugging post-cleanup (Default settings + Debug log):
-#    python folder_to_text.py /path/to/project --log-level DEBUG -o debug_run.txt 2> debug.log
-
+# Processes a primary input (folder or file), and optionally an additional context folder.
+# Simplifies text files, summarizes others, compresses patterns/lines. Includes raw dump.
 
 import os
 import re
@@ -30,29 +11,20 @@ import sys
 import string
 from pathlib import Path
 from collections import Counter
-# import json # Seems unused
 import logging
 import hashlib
 import io
-# import asyncio # Seems unused
-# import functools # Seems unused
-# import time # Seems unused
-# import datetime # Seems unused
-# from enum import Enum, auto # Seems unused
-# from collections import defaultdict # Seems unused
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional, Tuple, Any
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(funcName)s: %(message)s', stream=sys.stderr)
 log = logging.getLogger(__name__)
-
 
 # --- Configuration (Used by standard mode) ---
 IGNORE_PATTERNS = {
     '.git', '__pycache__', '.svn', '.hg', '.idea', '.vscode', 'node_modules',
     'build', 'dist', 'target', 'venv', '.venv', 'anaconda3', 'AppData',
     '.DS_Store', 'Thumbs.db',
-    'test', 'tests', '*.test.py', 'test_*.py', '*_test.py', '*.spec.py',
     '*.bak', '*.old', '*.tmp', '*~', '*.log', '*.swp', '*.zip', '*.gz', '*.tar',
     '*.class', '*.jar', '*.exe', '*.dll', '*.so', '*.o', '*.a', '*.lib',
     '*.pyc', '*.pyo',
@@ -82,15 +54,13 @@ SIMPLIFICATION_PATTERNS = [
     (re.compile(r'\d{8,}'), '*NUM_LONG*'),
     (re.compile(r'\b[a-fA-F0-9]{12,}\b'), '*HEX_LONG*'),
     (re.compile(r'[a-zA-Z0-9+/=]{30,}'), '*BASE64LIKE_LONG*'),
-    #(re.compile(r'\b\d{2,}\.\d{1,}|\d{1,}\.\d{2,}\b'), '*FLOAT*'),
-    #(re.compile(r'\b\d{3,}\b'), '*INT*'),
 ]
 
 POST_SIMPLIFICATION_PATTERNS = [
     (re.compile(r"""(['"])\b([a-fA-F0-9]{8}-?[a-fA-F0-9]{4}-?[a-fA-F0-9]{4}-?[a-fA-F0-9]{4}-?[a-fA-F0-9]{12})\b\1"""), r'"*UUID*"'),
     (re.compile(r"""(['"])(https?://[^/'"]+)(/[^'"\s]+/?)(\w+\.(?:py|js|html|css|png|jpg|gif|svg|json|xml|yaml|yml))\1"""), r'"\g<2>/*PATH*/\g<4>"'),
     (re.compile(r"""(['"])(https?://[^/'"]+)(/[^'"\s]+)\1"""), r'"\g<2>/*PATH*"'),
-    (re.compile(r"""(['"])((?:\\.|[^\\\1])*?)\1"""), # Corrected pattern
+    (re.compile(r"""(['"])((?:\\.|[^\\\1])*?)\1"""),
      lambda m: '...' if len(m.group(2)) > 10 else m.group(0)),
 ]
 
@@ -131,25 +101,23 @@ BLOCK_COMPRESSION_PATTERNS = {
     ),
     "QUOTED_UUID": re.compile(r"""^\s*(['"])[a-fA-F0-9]{8}-?[a-fA-F0-9]{4}-?[a-fA-F0-9]{4}-?[a-fA-F0-9]{4}-?[a-fA-F0-9]{12}\1,?$"""),
 }
-# --- Default changed ---
 DEFAULT_MIN_CONSECUTIVE_LINES = 3
 
 DEFINITION_SIMPLIFICATION_PATTERNS = [
     (re.compile(r'\b\d{2,}\.\d{1,}|\d{1,}\.\d{2,}\b'), '*FLOAT*'),
     (re.compile(r'\b\d{3,}\b'), '*INT*'),
-    (re.compile(r"""(['"])((?:\\.|[^\\\1])*?)\1"""), '...'), # Use corrected pattern
+    (re.compile(r"""(['"])((?:\\.|[^\\\1])*?)\1"""), '...'),
     (re.compile(r'\b[a-fA-F0-9]{10,}\b'), '*HEX*'),
     (re.compile(r'[a-zA-Z0-9+/=]{20,}'), '*BASE64LIKE*'),
 ]
 
 DEFAULT_LARGE_LITERAL_THRESHOLD = 10
 
-# --- Placeholders targeted by --post-cleanup ---
 ALL_PLACEHOLDERS = [
     r'\*...\*', r'\*INT\*', r'\*FLOAT\*', r'\*UUID\*',
     r'\*NUM_LONG\*', r'\*HEX_LONG\*', r'\*BASE64LIKE_LONG\*',
-    r'\*HEX\*', r'\*BASE64LIKE\*', # From definition simplification
-    r'\/\*PATH\*\/?' # Path placeholder (needs escaping)
+    r'\*HEX\*', r'\*BASE64LIKE\*',
+    r'\/\*PATH\*\/?'
 ]
 PLACEHOLDER_CLEANUP_PATTERN = re.compile(
     r"""^                 # Start of line
@@ -163,17 +131,15 @@ PLACEHOLDER_CLEANUP_PATTERN = re.compile(
        )+                 # One or more of these allowed elements
        \s*                # Optional trailing whitespace
        $                  # End of line
-    """.format(placeholder_group='|'.join(ALL_PLACEHOLDERS)), # Insert placeholder options
+    """.format(placeholder_group='|'.join(ALL_PLACEHOLDERS)),
     re.VERBOSE
 )
 
-
 # --- Globals ---
-seen_content_hashes = set() # Used by standard mode
+seen_content_hashes = set() # This will be shared if processing multiple inputs into one buffer
 
-# --- Helper Functions (Used by standard mode) ---
+# --- Helper Functions ---
 def is_likely_binary(filepath: Path) -> bool:
-    """ Checks if a file is likely binary. Reads a small chunk. """
     try:
         with open(filepath, 'rb') as f: chunk = f.read(BINARY_CHECK_BYTES)
         if not chunk: return False
@@ -190,7 +156,6 @@ def is_likely_binary(filepath: Path) -> bool:
         return False
 
 def summarize_other_files(filenames: list[str], code_extensions: set, interesting_filenames: set) -> str:
-    """ Creates a compressed summary of non-source text filenames. """
     if not filenames: return ""
     ext_counts = Counter(); explicit_files = set()
     interesting_lower = {fn.lower() for fn in interesting_filenames}; code_ext_lower = {ext.lower() for ext in code_extensions}
@@ -200,7 +165,6 @@ def summarize_other_files(filenames: list[str], code_extensions: set, interestin
                           base.lower() in interesting_lower or
                           fname in code_extensions or
                           base in code_extensions)
-
         if is_interesting: explicit_files.add(fname)
         elif ext_lower and ext_lower not in code_ext_lower: ext_counts[ext_lower] += 1
         elif not ext and base and fname_lower not in interesting_lower and base.lower() not in interesting_lower: ext_counts['<no_ext>'] += 1
@@ -211,7 +175,7 @@ def summarize_other_files(filenames: list[str], code_extensions: set, interestin
     if not summary_parts: return f"{len(filenames)} other file(s)"
     return ", ".join(summary_parts)
 
-# --- Core Processing Functions (Used by standard mode) ---
+# --- Core Processing Functions ---
 
 def simplify_source_code(
     content: str,
@@ -219,14 +183,7 @@ def simplify_source_code(
     large_literal_threshold: int,
     disable_literal_compression: bool
 ) -> str:
-    """
-    Simplifies source code: removes comments, blank lines, obfuscates constants,
-    compresses large literal lists/dicts (conditionally), optionally strips logging lines.
-    Applies basic simplification patterns from SIMPLIFICATION_PATTERNS.
-    (Used only in standard mode)
-    """
     if not content.strip(): return ""
-
     # Stage 1: Comment Removal
     content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
     content = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
@@ -251,37 +208,31 @@ def simplify_source_code(
         line = re.sub(r'^\s*--.*$', '', line) # SQL style whole line comments
         stripped_line = line.strip()
 
-        # Logging Removal (Optional)
         if strip_logging and stripped_line:
-            # Simple check for common logging/print patterns
             if re.match(r'^(?:log|logger|logging|console|print|fmt\.Print|System\.out\.print|TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\b', stripped_line, re.IGNORECASE):
-                 if '(' in stripped_line and ')' in stripped_line: # Basic check for function call
-                    continue # Skip this line
+                 if '(' in stripped_line and ')' in stripped_line: 
+                    continue 
 
-        # Large Literal Compression (Optional, disabled if --compress-patterns active)
         is_potential_start = list_dict_start_pattern.search(line) is not None
         is_end = stripped_line.startswith(']') or stripped_line.startswith('}')
-        current_line_index = len(simplified_lines) # Index where *this* line *would* go
+        current_line_index = len(simplified_lines) 
 
         if is_potential_start and not in_literal_block:
             in_literal_block = True
             literal_block_start_index = current_line_index
             literal_line_count = 0
-            simplified_lines.append(original_line) # Add the line that starts the block
+            simplified_lines.append(original_line) 
         elif in_literal_block:
             is_simple_literal_line = literal_line_pattern.match(stripped_line) is not None
             if is_simple_literal_line:
                 literal_line_count += 1
-                simplified_lines.append(original_line) # Add the literal line for now
+                simplified_lines.append(original_line) 
             elif is_end:
-                simplified_lines.append(original_line) # Add the line that ends the block
-                # Check if we should compress the block *now* that it's finished
+                simplified_lines.append(original_line) 
                 if not disable_literal_compression and literal_line_count >= large_literal_threshold and literal_block_start_index >= 0:
-                    # Calculate slice indices relative to the *current* simplified_lines
-                    start_slice_idx = literal_block_start_index + 1 # First literal line
-                    end_slice_idx = start_slice_idx + literal_line_count # One past the last literal line
-                    if start_slice_idx < end_slice_idx <= len(simplified_lines)-1: # Ensure indices are valid
-                         # Determine indent from the line *after* the start or the line *before* the end
+                    start_slice_idx = literal_block_start_index + 1 
+                    end_slice_idx = start_slice_idx + literal_line_count 
+                    if start_slice_idx < end_slice_idx <= len(simplified_lines)-1: 
                          try:
                             indent_line = simplified_lines[start_slice_idx] if start_slice_idx < len(simplified_lines) else simplified_lines[literal_block_start_index]
                             indent_level = indent_line.find(indent_line.lstrip()) if indent_line.strip() else 2 # Guess indent if blank
@@ -290,281 +241,338 @@ def simplify_source_code(
 
                          indent = " " * (indent_level)
                          placeholder_line = f"{indent}# --- Large literal collection compressed ({literal_line_count} lines) ---"
-                         # Replace the literal lines with the placeholder
                          del simplified_lines[start_slice_idx:end_slice_idx]
                          simplified_lines.insert(start_slice_idx, placeholder_line)
                          log.debug(f"Compressed literal block, {literal_line_count} lines.")
                     else:
                          log.warning(f"Compression slice calculation error: start={start_slice_idx}, end={end_slice_idx}, len={len(simplified_lines)}. Skipping literal compression.")
-                # Reset literal block state regardless of compression
                 in_literal_block = False
                 literal_block_start_index = -1
                 literal_line_count = 0
-            else:
-                # A non-simple, non-end line occurred within the block - treat it as ending the potential compression
+            else: # A non-simple, non-end line occurred
                 log.debug(f"Complex line ended potential literal block compression.")
                 simplified_lines.append(original_line) # Add the complex line
                 in_literal_block = False
                 literal_block_start_index = -1
                 literal_line_count = 0
-        # Regular line processing (not in a literal block)
-        elif stripped_line: # Keep non-blank lines
+        elif stripped_line: 
             simplified_lines.append(line)
-        elif simplified_lines and simplified_lines[-1].strip(): # Add a single blank line if the previous wasn't blank
+        elif simplified_lines and simplified_lines[-1].strip(): 
             simplified_lines.append("")
 
-    # Final processing after line iteration
     processed_content = "\n".join(simplified_lines).strip()
-    if processed_content: processed_content += "\n" # Ensure trailing newline if content exists
+    if processed_content: processed_content += "\n" 
 
-    # Apply basic simplification patterns
     for pattern, replacement in SIMPLIFICATION_PATTERNS:
         processed_content = pattern.sub(replacement, processed_content)
 
-    # Final blank line cleanup
     processed_content = re.sub(r'\n{3,}', '\n\n', processed_content)
     return processed_content
 
+def process_single_file_content(
+    target_file_path: Path,
+    buffer: io.StringIO,
+    strip_logging: bool,
+    large_literal_threshold: int,
+    compress_patterns_enabled: bool, # For simplify_source_code
+    is_additional_context: bool = False # To slightly change logging/headers
+):
+    """
+    Processes a single file and writes its simplified content to the buffer.
+    Used for both primary single file input and files within an additional context folder.
+    """
+    def write_to_buffer(text): buffer.write(text + "\n")
 
-def process_folder(
-    target_folder: str,
+    log_prefix = "Additional Context: " if is_additional_context else ""
+    log.debug(f"{log_prefix}Processing single file: {target_file_path} (Standard Mode)")
+
+    try:
+        # For display, use relative path from CWD if possible, else just the name.
+        # If it's additional context, it's likely already a full path or relative to something known.
+        display_path_str = str(target_file_path.relative_to(Path.cwd())) if target_file_path.is_absolute() else str(target_file_path)
+    except ValueError:
+        display_path_str = str(target_file_path)
+    
+    file_info_prefix = f"--- File: {display_path_str}"
+    if is_additional_context:
+        file_info_prefix = f"--- File (from additional context): {display_path_str}"
+
+
+    if is_likely_binary(target_file_path):
+        log.warning(f"{log_prefix}Skipping likely binary file: {target_file_path}")
+        write_to_buffer(file_info_prefix + " --- SKIPPED (BINARY) ---")
+        write_to_buffer("")
+        return
+
+    try:
+        log.debug(f"{log_prefix}Reading and simplifying source file: {target_file_path}")
+        with open(target_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+
+        simplified_content = simplify_source_code(
+            content,
+            strip_logging,
+            large_literal_threshold,
+            disable_literal_compression=compress_patterns_enabled
+        )
+
+        is_empty_after_simplification = not simplified_content.strip()
+
+        # Skip_empty and skip_duplicates are not applied here directly,
+        # as this function is about getting one file's content.
+        # These flags are for the folder iteration logic.
+        # However, seen_content_hashes *could* be checked here if processing multiple additional files.
+
+        write_to_buffer(file_info_prefix + " ---")
+
+        if is_empty_after_simplification:
+            write_to_buffer("# (File is empty or contained only comments/whitespace/logging after simplification)")
+        else:
+            write_to_buffer(simplified_content.strip())
+
+        write_to_buffer(f"--- End File: {display_path_str} ---")
+        write_to_buffer("") 
+
+    except OSError as e:
+        log.error(f"{log_prefix}Error reading file {target_file_path}: {e}")
+        write_to_buffer(file_info_prefix + " Error Reading ---")
+        write_to_buffer(f"### Error reading file: {type(e).__name__}: {e} ###")
+        write_to_buffer(f"--- End File: {display_path_str} ---"); write_to_buffer("")
+    except Exception as e:
+        log.error(f"{log_prefix}Error processing file {target_file_path}: {e}", exc_info=(log.getEffectiveLevel() <= logging.DEBUG))
+        write_to_buffer(file_info_prefix + " Error Processing ---")
+        write_to_buffer(f"### Error processing file: {type(e).__name__}: {e} ###")
+        write_to_buffer(f"--- End File: {display_path_str} ---"); write_to_buffer("")
+
+
+def process_folder_contents( # Renamed to avoid confusion with old process_folder
+    folder_to_scan: Path, # Expects a resolved Path object
     buffer: io.StringIO,
     ignore_set: set,
     code_extensions_set: set,
     interesting_filenames_set: set,
     skip_empty: bool,
     strip_logging: bool,
-    skip_duplicates: bool,
+    skip_duplicates: bool, # This will use the global `seen_content_hashes`
     large_literal_threshold: int,
-    compress_patterns_enabled: bool
+    compress_patterns_enabled: bool,
+    is_additional_context: bool = False # To slightly change logging/headers
 ):
     """
-    Processes the folder using simplification, filtering, etc. (Standard Mode).
+    Processes a folder and writes its simplified content to the buffer.
+    Uses global `seen_content_hashes` for deduplication if `skip_duplicates` is True.
     """
-    global seen_content_hashes
-    target_path = Path(target_folder).resolve()
+    global seen_content_hashes # Make sure we're using the global set
     def write_to_buffer(text): buffer.write(text + "\n")
 
-    log.debug(f"Starting folder walk for: {target_path} (Standard Mode)")
-    log.debug(f"Effective skip_empty: {skip_empty}, skip_duplicates: {skip_duplicates}")
+    log_prefix = "Additional Context Folder: " if is_additional_context else "Primary Folder: "
+    log.debug(f"Starting folder walk for: {log_prefix}{folder_to_scan} (Standard Mode)")
+    # The problematic 'is_processing_directory' check was here.
+    # We can directly use 'skip_empty' and 'skip_duplicates' as they are passed in.
+    # This log line is more relevant when these flags are first determined in main().
+    # We can add a specific log if it's the primary folder scan for clarity.
+    if not is_additional_context:
+         log.debug(f"Primary folder scan - Effective skip_empty: {skip_empty}, skip_duplicates: {skip_duplicates}")
 
-    for dirpath, dirnames, filenames in os.walk(target_path, topdown=True, onerror=lambda e: log.warning(f"Cannot access {e.filename} - {e}")):
-        current_path = Path(dirpath)
+
+    for dirpath_str, dirnames, filenames in os.walk(folder_to_scan, topdown=True, onerror=lambda e: log.warning(f"Cannot access {e.filename} - {e}")):
+        current_path = Path(dirpath_str)
         try:
-            current_rel_path = current_path.relative_to(target_path)
+            # Relative path for display within this folder's context
+            current_rel_path_in_scan = current_path.relative_to(folder_to_scan)
         except ValueError:
-            log.warning(f"Could not determine relative path for {current_path} against base {target_path}. Skipping directory.")
-            dirnames[:] = [] # Don't traverse further down this path
+            log.warning(f"Could not determine relative path for {current_path} against base {folder_to_scan}. Skipping.")
+            dirnames[:] = [] 
             continue
 
-        log.debug(f"Processing directory: {current_rel_path}")
+        log.debug(f"{log_prefix}Processing directory: {current_rel_path_in_scan}")
 
-        # Filter ignored directories *before* recursing into them
         dirnames[:] = [
             d for d in dirnames if
             d not in ignore_set and
-            not d.startswith('.') and # Generic hidden folder check
-            not any(Path(d).match(p) for p in ignore_set if '*' in p or '?' in p) # Glob pattern check
+            not d.startswith('.') and
+            not any(Path(d).match(p) for p in ignore_set if '*' in p or '?' in p)
         ]
         filenames.sort()
-        dirnames.sort() # Ensure deterministic order
+        dirnames.sort()
 
         source_files_to_process = []
         other_text_filenames = []
 
-        # Filter files in the current directory
         for filename in filenames:
-            # Check basic ignores
+            # Basic ignore checks
             if filename in ignore_set or any(Path(filename).match(p) for p in ignore_set if '*' in p or '?' in p):
-                log.debug(f"Ignoring file by pattern: {current_rel_path / filename}")
+                log.debug(f"{log_prefix}Ignoring file by pattern: {current_rel_path_in_scan / filename}")
                 continue
-            # Check hidden files (unless explicitly interesting or code)
             if filename.startswith('.') and filename.lower() not in interesting_filenames_set and filename not in code_extensions_set:
-                 log.debug(f"Ignoring hidden file: {current_rel_path / filename}")
+                 log.debug(f"{log_prefix}Ignoring hidden file: {current_rel_path_in_scan / filename}")
                  continue
 
-            file_path = current_path / filename
-            if not file_path.is_file(): continue # Skip if not a file (e.g., broken symlink)
+            file_path_abs = current_path / filename # Absolute path of the file
+            if not file_path_abs.is_file(): continue
 
-            # Check for binary files
-            if is_likely_binary(file_path):
-                log.debug(f"Skipping likely binary file: {file_path.relative_to(target_path)}")
+            if is_likely_binary(file_path_abs):
+                log.debug(f"{log_prefix}Skipping likely binary file: {file_path_abs}")
                 continue
 
-            # Categorize file
             base, ext = os.path.splitext(filename); ext_lower = ext.lower(); fname_lower = filename.lower()
             is_source = (ext_lower in code_extensions_set or
                          filename in code_extensions_set or # Check full filename (e.g., Dockerfile)
-                         fname_lower in code_extensions_set) # Check lower full filename
+                         fname_lower in code_extensions_set)
 
-            relative_file_path = file_path.relative_to(target_path)
+            # For display in logs/headers, use path relative to the *root* of this scan
+            relative_file_path_in_scan = file_path_abs.relative_to(folder_to_scan)
             if is_source:
-                source_files_to_process.append((relative_file_path, file_path, ext_lower))
+                # Pass absolute path for opening, relative for display/hashing context
+                source_files_to_process.append((relative_file_path_in_scan, file_path_abs))
             else:
-                other_text_filenames.append(filename)
+                other_text_filenames.append(filename) # filename is already relative to current_rel_path_in_scan
 
-        # Process source files for this directory
         if source_files_to_process:
-            dir_header = f"\n{'=' * 10} Directory: {current_rel_path} {'=' * 10}\n" if str(current_rel_path) != '.' else ""
+            dir_header_display_path = str(current_rel_path_in_scan) if str(current_rel_path_in_scan) != '.' else folder_to_scan.name
+            dir_header = f"\n{'=' * 10} Directory ({log_prefix.strip(': ')}): {dir_header_display_path} {'=' * 10}\n"
             if dir_header: write_to_buffer(dir_header)
 
-            for rel_path, full_path, file_ext in source_files_to_process:
-                file_info_prefix = f"--- File: {rel_path}"
+            for rel_path_in_scan, full_path_abs in source_files_to_process:
+                # Display path for file markers should be unique and informative
+                # If it's additional context, make it clear
+                display_path_for_marker = f"{folder_to_scan.name}/{rel_path_in_scan}" if is_additional_context and str(folder_to_scan.name) != "." else str(rel_path_in_scan)
+                
+                file_info_prefix = f"--- File: {display_path_for_marker}"
                 try:
-                    log.debug(f"Processing source file: {rel_path}")
-                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    log.debug(f"{log_prefix}Processing source file: {full_path_abs}")
+                    with open(full_path_abs, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
 
                     simplified_content = simplify_source_code(
                         content,
                         strip_logging,
                         large_literal_threshold,
-                        disable_literal_compression=compress_patterns_enabled # Pass the flag
+                        disable_literal_compression=compress_patterns_enabled
                     )
 
                     is_empty_after_simplification = not simplified_content.strip()
-                    content_hash = None
-                    is_duplicate = False
-
-                    # Check if skipping empty files
+                    
                     if skip_empty and is_empty_after_simplification:
-                        log.info(f"Skipping empty file (after simplification): {rel_path}")
-                        continue # Skip to next file
+                        log.info(f"{log_prefix}Skipping empty file (after simplification): {full_path_abs}")
+                        continue 
 
-                    # Check for duplicates if enabled and file is not empty
                     if skip_duplicates and not is_empty_after_simplification:
                         content_hash = hashlib.sha256(simplified_content.encode('utf-8')).hexdigest()
                         if content_hash in seen_content_hashes:
-                            is_duplicate = True
-                            log.info(f"Skipping duplicate content file: {rel_path} (Hash: {content_hash[:8]}...)")
-                            continue # Skip to next file
+                            log.info(f"{log_prefix}Skipping duplicate content file: {full_path_abs} (Hash: {content_hash[:8]}...)")
+                            continue 
                         else:
-                             # Only add hash if skip_duplicates is enabled and it's not a duplicate
                              seen_content_hashes.add(content_hash)
-                             log.debug(f"Adding new content hash: {content_hash[:8]}... for {rel_path}")
+                             log.debug(f"{log_prefix}Adding new content hash: {content_hash[:8]}... for {full_path_abs}")
 
-
-                    # Write file header
                     write_to_buffer(file_info_prefix + " ---")
 
-                    # Write content or empty message
                     if is_empty_after_simplification:
                         write_to_buffer("# (File is empty or contained only comments/whitespace/logging)")
                     else:
                         write_to_buffer(simplified_content.strip())
 
-                    # Write file footer
-                    write_to_buffer(f"--- End File: {rel_path} ---")
-                    write_to_buffer("") # Add a blank line between files
+                    write_to_buffer(f"--- End File: {display_path_for_marker} ---")
+                    write_to_buffer("") 
 
                 except OSError as e:
-                    log.error(f"Error reading file {rel_path}: {e}")
+                    log.error(f"{log_prefix}Error reading file {full_path_abs}: {e}")
                     write_to_buffer(file_info_prefix + " Error Reading ---")
                     write_to_buffer(f"### Error reading file: {type(e).__name__}: {e} ###")
-                    write_to_buffer(f"--- End File: {rel_path} ---")
-                    write_to_buffer("")
+                    write_to_buffer(f"--- End File: {display_path_for_marker} ---"); write_to_buffer("")
                 except Exception as e:
-                    log.error(f"Error processing file {rel_path}: {e}", exc_info=(log.getEffectiveLevel() <= logging.DEBUG))
+                    log.error(f"{log_prefix}Error processing file {full_path_abs}: {e}", exc_info=(log.getEffectiveLevel() <= logging.DEBUG))
                     write_to_buffer(file_info_prefix + " Error Processing ---")
                     write_to_buffer(f"### Error processing file: {type(e).__name__}: {e} ###")
-                    write_to_buffer(f"--- End File: {rel_path} ---")
-                    write_to_buffer("")
+                    write_to_buffer(f"--- End File: {display_path_for_marker} ---"); write_to_buffer("")
 
-        # Add summary for other files in this directory
         if other_text_filenames:
             summary = summarize_other_files(other_text_filenames, code_extensions_set, interesting_filenames_set)
             if summary:
-                indent_level = len(current_rel_path.parts)
+                # Indentation based on depth within *this* scanned folder
+                indent_level = len(current_rel_path_in_scan.parts) if str(current_rel_path_in_scan) != '.' else 0
                 indent = "  " * indent_level if indent_level > 0 else ""
-                summary_line = f"{indent}# Other files in '{current_rel_path}': {summary}"
-                log.debug(f"Adding summary for {current_rel_path}: {summary}")
-                # Ensure summary is added even if no source files were processed in this dir
-                # Check if the buffer ends with the directory header or a blank line
+                summary_line = f"{indent}# Other files in '{current_rel_path_in_scan}': {summary}"
+                log.debug(f"{log_prefix}Adding summary for {current_rel_path_in_scan}: {summary}")
+                
                 buffer.seek(0, io.SEEK_END)
                 current_pos = buffer.tell()
                 if current_pos > 0:
-                    buffer.seek(max(0, current_pos - 200)) # Read last bit
+                    buffer.seek(max(0, current_pos - 300)) # Read last bit
                     last_part = buffer.read()
-                    if not last_part.strip().endswith(f"Directory: {current_rel_path} {'=' * 10}") and not last_part.endswith("\n\n"):
+                    # Check if the buffer ends with the directory header or a blank line
+                    dir_header_display_path = str(current_rel_path_in_scan) if str(current_rel_path_in_scan) != '.' else folder_to_scan.name
+                    if not last_part.strip().endswith(f"Directory ({log_prefix.strip(': ')}): {dir_header_display_path} {'=' * 10}") and \
+                       not last_part.endswith("\n\n"):
                          write_to_buffer("") # Add separator if needed
                 write_to_buffer(summary_line)
-                write_to_buffer("") # Add blank line after summary
+                write_to_buffer("")
 
-# --- NEW Raw Dump Function ---
-def process_folder_raw(target_folder: str, buffer: io.StringIO):
+
+def process_folder_raw(target_input_path_str: str, buffer: io.StringIO, additional_context_folder_str: Optional[str] = None):
     """
-    Walks the folder and dumps every file's content verbatim into the buffer.
-    (Used only in raw dump mode)
+    Dumps content of primary input (file/folder) and optionally an additional context folder verbatim.
     """
-    target_path = Path(target_folder).resolve()
-    log.debug(f"Starting RAW folder walk for: {target_path}")
-    file_count = 0
+    paths_to_process = [(Path(target_input_path_str).resolve(), "Primary Input")]
+    if additional_context_folder_str:
+        additional_path = Path(additional_context_folder_str).resolve()
+        if additional_path.is_dir():
+            paths_to_process.append((additional_path, "Additional Context Folder"))
+        else:
+            log.warning(f"Raw Dump: Additional context path '{additional_path}' is not a directory, skipping.")
 
-    # Sort directories and files for consistent output order
-    walk_results = sorted(list(os.walk(target_path, topdown=True, onerror=lambda e: log.warning(f"Cannot access {e.filename} - {e}"))), key=lambda x: x[0])
+    for current_target_path_obj, current_target_desc in paths_to_process:
+        log.debug(f"Starting RAW dump for {current_target_desc}: {current_target_path_obj}")
+        file_count_for_target = 0
 
-    for dirpath, dirnames, filenames in walk_results:
-        # Sort within directory for consistency
-        dirnames.sort()
-        filenames.sort()
-
-        current_path = Path(dirpath)
-        try:
-            current_rel_path = current_path.relative_to(target_path)
-        except ValueError:
-            log.warning(f"Could not determine relative path for {current_path} against base {target_path}. Skipping directory.")
-            continue # Skip this directory path
-
-        log.debug(f"Processing directory (RAW): {current_rel_path}")
-
-        for filename in filenames:
-            file_path = current_path / filename
-            relative_file_path = file_path.relative_to(target_path)
-
-            if not file_path.is_file():
-                log.debug(f"Skipping non-file entry: {relative_file_path}")
-                continue # Skip directories, broken symlinks etc.
-
-            file_count += 1
-            # --- File Header ---
-            buffer.write(f"\n{'=' * 20} START FILE: {relative_file_path} {'=' * 20}\n")
-            log.info(f"Dumping file ({file_count}): {relative_file_path}")
-
+        if current_target_path_obj.is_file():
+            buffer.write(f"\n{'=' * 20} START FILE ({current_target_desc}): {current_target_path_obj.name} {'=' * 20}\n")
             try:
-                # Read as text, ignoring decoding errors. Binary content will likely be mangled.
-                # Consider reading as bytes if true binary handling is needed, but output becomes complex.
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                # Ensure content ends with a newline for cleaner separation
-                if not content.endswith('\n'):
-                    content += '\n'
+                with open(current_target_path_obj, 'r', encoding='utf-8', errors='ignore') as f: content = f.read()
+                if content and not content.endswith('\n'): content += '\n'
                 buffer.write(content)
-            except OSError as e:
-                log.error(f"Error reading file {relative_file_path}: {e}")
-                buffer.write(f"### Error reading file: {type(e).__name__}: {e} ###\n")
+                file_count_for_target = 1
             except Exception as e:
-                log.error(f"Unexpected error processing file {relative_file_path}: {e}", exc_info=(log.getEffectiveLevel() <= logging.DEBUG))
-                buffer.write(f"### Unexpected error processing file: {type(e).__name__}: {e} ###\n")
+                log.error(f"Error reading/writing file {current_target_path_obj.name} for raw dump: {e}")
+                buffer.write(f"### Error during raw dump of {current_target_path_obj.name}: {e} ###\n")
+            buffer.write(f"{'=' * 20} END FILE ({current_target_desc}): {current_target_path_obj.name} {'=' * 20}\n")
+        
+        elif current_target_path_obj.is_dir():
+            buffer.write(f"\n{'=' * 10} STARTING RAW DUMP OF {current_target_desc.upper()}: {current_target_path_obj.name} {'=' * 10}\n")
+            walk_results = sorted(list(os.walk(current_target_path_obj, topdown=True, onerror=lambda e: log.warning(f"Cannot access {e.filename} - {e}"))), key=lambda x: x[0])
+            for dirpath, dirnames, filenames in walk_results:
+                dirnames.sort(); filenames.sort()
+                current_path_in_walk = Path(dirpath)
+                for filename_in_walk in filenames:
+                    file_path_in_walk = current_path_in_walk / filename_in_walk
+                    relative_file_path_display = file_path_in_walk.relative_to(current_target_path_obj)
+                    if not file_path_in_walk.is_file(): continue
+                    file_count_for_target +=1
+                    buffer.write(f"\n{'=' * 20} START FILE ({current_target_desc}/{relative_file_path_display}): {filename_in_walk} {'=' * 20}\n")
+                    try:
+                        with open(file_path_in_walk, 'r', encoding='utf-8', errors='ignore') as f: content_f = f.read()
+                        if content_f and not content_f.endswith('\n'): content_f += '\n'
+                        buffer.write(content_f)
+                    except Exception as e:
+                        log.error(f"Error reading/writing file {file_path_in_walk} for raw dump: {e}")
+                        buffer.write(f"### Error during raw dump of {file_path_in_walk}: {e} ###\n")
+                    buffer.write(f"{'=' * 20} END FILE ({current_target_desc}/{relative_file_path_display}): {filename_in_walk} {'=' * 20}\n")
+            buffer.write(f"\n{'=' * 10} FINISHED RAW DUMP OF {current_target_desc.upper()}: {current_target_path_obj.name} ({file_count_for_target} files) {'=' * 10}\n")
+        else:
+            log.error(f"Raw dump target '{current_target_path_obj}' from {current_target_desc} is neither a file nor a directory.")
+            buffer.write(f"### ERROR: Raw dump target '{current_target_path_obj}' is not valid. ###\n")
+        
+        log.info(f"Finished raw dump for {current_target_desc}. Processed {file_count_for_target} file(s).")
 
-            # --- File Footer ---
-            buffer.write(f"{'=' * 20} END FILE: {relative_file_path} {'=' * 20}\n")
 
-    log.info(f"Finished raw dump. Processed {file_count} files.")
-
-
-# --- Post-Processing Functions (Used by standard mode) ---
-
+# --- Post-Processing Functions ---
+# [UNCHANGED: apply_post_simplification_patterns, expand_multi_pattern_lines, compress_pattern_blocks, minify_repeated_lines, post_process_cleanup]
+# ... (These functions are identical to the previous version) ...
 def apply_post_simplification_patterns(content: str, patterns: list[tuple[re.Pattern, Any]]) -> tuple[str, int]:
-    """
-    Applies a list of regex patterns and replacements to the content.
-    Handles both string and lambda replacements.
-    (Used only in standard mode)
-    """
     total_replacements = 0
-    modified_content = content
     lines = content.splitlines(keepends=True)
     output_lines = []
-
     log.debug(f"Applying {len(patterns)} post-simplification patterns...")
     pattern_counts = Counter()
 
@@ -572,79 +580,58 @@ def apply_post_simplification_patterns(content: str, patterns: list[tuple[re.Pat
         modified_line = line
         for i, (pattern, replacement) in enumerate(patterns):
             try:
-                 original_line_segment = modified_line # Keep track for logging changes
+                 original_line_segment = modified_line
                  if callable(replacement):
                      modified_line_new, count = pattern.subn(replacement, modified_line)
                  else:
                      modified_line_new, count = pattern.subn(replacement, modified_line)
-
                  if count > 0:
                      total_replacements += count
                      pattern_counts[i] += count
                      if log.getEffectiveLevel() <= logging.DEBUG:
-                         # Find changed part for better logging (approximate)
                          diff_start = -1
                          for k in range(min(len(original_line_segment), len(modified_line_new))):
                              if original_line_segment[k] != modified_line_new[k]:
                                  diff_start = k
                                  break
                          log.debug(f"  Pattern {i} ({pattern.pattern[:30]}...) matched {count} time(s) on line: ...{original_line_segment[max(0,diff_start-10):diff_start+10]}... -> ...{modified_line_new[max(0,diff_start-10):diff_start+10]}...")
-                     modified_line = modified_line_new # Update line for next pattern
+                     modified_line = modified_line_new
             except Exception as e:
                 log.error(f"Error applying post-simplification pattern {i} ({pattern.pattern}) to line: {e}")
-                log.debug(f"Problematic line: {line.strip()[:100]}") # Log snippet
-
+                log.debug(f"Problematic line: {line.strip()[:100]}")
         output_lines.append(modified_line)
-
     modified_content = "".join(output_lines)
-
     if pattern_counts:
         log.debug("Post-simplification pattern match counts:")
         for i, count in pattern_counts.items():
             log.debug(f"  Pattern {i} ({patterns[i][0].pattern[:50]}...): {count} matches")
-
     log.info(f"Applied {len(patterns)} post-simplification patterns, making {total_replacements} total replacements.")
     return modified_content, total_replacements
-
 
 def expand_multi_pattern_lines(
     content: str,
     finder_pattern: re.Pattern,
     pattern_name_for_log: str = "PATTERN"
     ) -> tuple[str, int]:
-    """
-    Scans content for lines containing multiple instances of a pattern
-    and splits them into individual lines, preserving indentation.
-    (Used only in standard mode)
-    """
-    lines = content.splitlines(keepends=False) # Don't keep ends, add them back later
+    lines = content.splitlines(keepends=False)
     output_lines = []
     lines_expanded = 0
     log.debug(f"--- expand_multi_pattern_lines: Starting scan for '{pattern_name_for_log}' ---")
 
     for i, line in enumerate(lines):
         stripped_line = line.strip()
-        # Skip comments, headers, etc.
         if not stripped_line or stripped_line.startswith(("#", "---", "##", "==", "*LINE_REF_")):
             output_lines.append(line + "\n")
             continue
-
         try:
-            # Use findall to get all non-overlapping matches
             matches = finder_pattern.findall(line)
         except Exception as e:
             log.error(f"Regex error finding patterns on line {i+1}: {e}")
             log.debug(f"Problematic line: {line}")
             matches = []
-
-        # Only expand if *multiple* distinct matches are found on the line
         if len(matches) > 1:
-             # Heuristic check: Ensure matches cover a significant part of the stripped line
-             # This avoids splitting lines where the pattern might appear incidentally
-             combined_match_len = sum(len(str(m).strip(',').strip()) for m in matches) # Use str(m) if group is captured
-             stripped_len_approx = len(re.sub(r'\s+|,', '', stripped_line)) # Approx length without spaces/commas
-
-             # Require matches to cover >80% of the significant content
+             combined_match_len = sum(len(str(m).strip(',').strip()) for m in matches)
+             stripped_len_approx = len(re.sub(r'\s+|,', '', stripped_line))
              if combined_match_len >= stripped_len_approx * 0.8:
                 log.info(f"Expanding line {i+1} containing {len(matches)} instances of '{pattern_name_for_log}'.")
                 log.debug(f"Original line {i+1}: {line.strip()}")
@@ -652,24 +639,15 @@ def expand_multi_pattern_lines(
                 indent_level = line.find(stripped_line[0]) if stripped_line else 0
                 indent = " " * indent_level
                 for match_item in matches:
-                    # Assuming findall captures the exact string needed (Group 1 in the example)
-                    match_str = str(match_item).strip() # Use str() for safety if match can be non-string
+                    match_str = str(match_item).strip()
                     output_lines.append(f"{indent}{match_str}\n")
                     log.debug(f"  Expanded to: {indent}{match_str}")
-                continue # Skip adding the original line
-
-        # If not expanded, add the original line back
+                continue
         output_lines.append(line + "\n")
-
     log.info(f"Finished line expansion pre-processing. Expanded {lines_expanded} lines containing multiple '{pattern_name_for_log}' instances.")
     return "".join(output_lines), lines_expanded
 
-
 def compress_pattern_blocks(content: str, patterns_to_compress: dict[str, re.Pattern], min_consecutive: int) -> tuple[str, int]:
-    """
-    Scans content for consecutive lines matching predefined patterns and compresses them.
-    (Used only in standard mode)
-    """
     lines = content.splitlines(keepends=True)
     output_lines = []
     total_blocks_compressed = 0
@@ -680,206 +658,137 @@ def compress_pattern_blocks(content: str, patterns_to_compress: dict[str, re.Pat
         current_line = lines[i]
         stripped_line = current_line.strip()
         matched_pattern_name = None
-
-        # Define lines that should *not* start or be part of a compressed block
         is_ignorable = (
             stripped_line.startswith(("--- File:", "--- End File:", "#", "===", "*LINE_REF_", "## [Compressed Block:")) or
-            not stripped_line # Ignore blank lines
+            not stripped_line
         )
-
         if not is_ignorable:
-            # Check if the current stripped line matches any compression pattern
             for name, pattern in patterns_to_compress.items():
                 if pattern.match(stripped_line):
                     matched_pattern_name = name
                     log.debug(f"Line {i+1} potentially starts block '{name}': {stripped_line[:60]}...")
-                    break # Found a match for this line
-
+                    break
         if matched_pattern_name:
             block_pattern_name = matched_pattern_name
             block_start_index = i
-            block_lines_indices = [i] # Store indices of lines matching the *same* pattern consecutively
-            j = i + 1 # Look ahead index
-
-            # Greedily consume consecutive lines matching the *same* pattern
+            block_lines_indices = [i]
+            j = i + 1
             while j < len(lines):
                 next_line_raw = lines[j]
                 next_stripped = next_line_raw.strip()
-
-                # Check if the next line is ignorable (blank, comment, etc.)
                 next_is_ignorable = (
                     next_stripped.startswith(("--- File:", "--- End File:", "#", "===", "*LINE_REF_", "## [Compressed Block:")) or
                     not next_stripped
                 )
                 if next_is_ignorable:
                     log.debug(f"  Block '{block_pattern_name}' interrupted at line {j+1} by ignorable line.")
-                    break # Stop consuming for this block
-
-                # Check if the next line matches the *same* pattern as the block started with
+                    break
                 if patterns_to_compress[block_pattern_name].match(next_stripped):
                     block_lines_indices.append(j)
                     log.debug(f"  Line {j+1} continues block '{block_pattern_name}'.")
                     j += 1
                 else:
                     log.debug(f"  Block '{block_pattern_name}' ended at line {j+1} (no match or different pattern).")
-                    break # Pattern doesn't match, end of this block
-
-            # Check if enough consecutive lines were found
+                    break
             block_count = len(block_lines_indices)
             if block_count >= min_consecutive:
-                # Determine indentation from the first line of the block
                 first_line_in_block = lines[block_start_index]
                 indent = ""
                 first_line_stripped = first_line_in_block.strip()
                 if len(first_line_in_block) > len(first_line_stripped):
                      indent = first_line_in_block[:len(first_line_in_block) - len(first_line_stripped)]
-
-                # Create summary line and add it
                 summary_line = f"{indent}## [Compressed Block: {block_count} lines matching pattern '{block_pattern_name}'] ##\n"
                 output_lines.append(summary_line)
                 log.info(f"Compressed {block_count} lines (Indices {block_start_index+1}-{j}) matching '{block_pattern_name}'.")
                 total_blocks_compressed += 1
-                i = j # Move main index past the consumed block
+                i = j
             else:
-                # Not enough consecutive lines, add them individually
                 log.debug(f"  Block '{block_pattern_name}' starting at line {block_start_index+1} had only {block_count} lines (min={min_consecutive}). Not compressing.")
                 for block_line_index in block_lines_indices:
                     output_lines.append(lines[block_line_index])
-                i = j # Move main index past the checked lines
+                i = j
         else:
-            # Line didn't match any pattern or was ignorable, add it and move to the next
             output_lines.append(current_line)
             i += 1
-
     log.info(f"Pattern block compression: Compressed {total_blocks_compressed} blocks of lines (min consecutive: {min_consecutive}).")
     return "".join(output_lines), total_blocks_compressed
 
-
 def minify_repeated_lines(content: str, min_length: int, min_repetitions: int) -> tuple[str, int]:
-    """
-    Identifies repeated identical long lines, replaces them with placeholders,
-    and simplifies the content within the definition block.
-    (Used only in standard mode)
-    """
     global DEFINITION_SIMPLIFICATION_PATTERNS
-
-    lines = content.splitlines(keepends=True) # Keep line endings for accurate replacement
+    lines = content.splitlines(keepends=True)
     line_counts = Counter()
-    num_replaced = 0
     definitions = {}
     placeholder_template = "*LINE_REF_{}*"
-    meaningful_lines_indices = {} # Map line content -> list of indices where it appears
-
+    meaningful_lines_indices = {}
     log.debug(f"--- minify_repeated_lines: Scanning for lines >= {min_length} chars, repeated >= {min_repetitions} times ---")
 
-    # First pass: Count occurrences and record indices of potentially minifiable lines
     for i, line in enumerate(lines):
-        # Use the raw line (including whitespace and ending) as the key for exact matches
         line_content_key = line
         stripped_line = line.strip()
-
-        # Define lines that should NOT be minified (structure, comments, previous placeholders, short lines)
         is_structural_or_placeholder = (
             stripped_line.startswith(("--- File:", "--- End File:", "#", "===", "*LINE_REF_", "## [Compressed Block:")) or
-            re.match(r'^\*VOICE:.*\*$', stripped_line) or # Example placeholder patterns
+            re.match(r'^\*VOICE:.*\*$', stripped_line) or
             re.match(r'^\*UUID\*$', stripped_line) or
             re.match(r'^\*...\*$', stripped_line) or
-            not stripped_line # Exclude blank lines
+            not stripped_line
         )
-
         if len(stripped_line) >= min_length and not is_structural_or_placeholder:
             line_counts[line_content_key] += 1
             if line_content_key not in meaningful_lines_indices:
                 meaningful_lines_indices[line_content_key] = []
             meaningful_lines_indices[line_content_key].append(i)
-            # Log potential candidates at DEBUG level if needed
-            # if line_counts[line_content_key] == min_repetitions:
-            #     log.debug(f"  Line '{stripped_line[:60]}...' (len={len(stripped_line)}) reached min repetitions ({min_repetitions}) at index {i}.")
 
-    # Second pass: Identify lines meeting the repetition threshold and create definitions/replacements
-    replacement_map = {} # Map original line content -> placeholder string
+    replacement_map = {}
     definition_lines = []
     placeholder_counter = 1
-
-    # Sort candidates by frequency (desc) and then alphabetically for deterministic placeholder assignment
     repeated_lines = sorted(
         [(line, count) for line, count in line_counts.items() if count >= min_repetitions],
-        key=lambda item: (-item[1], item[0]) # Sort by count descending, then line content ascending
+        key=lambda item: (-item[1], item[0])
     )
-
     for line, count in repeated_lines:
-        if line not in replacement_map: # Ensure we only define each unique line once
+        if line not in replacement_map:
             placeholder = placeholder_template.format(placeholder_counter)
             replacement_map[line] = placeholder
             log.debug(f"  Creating definition {placeholder} for line repeated {count} times: {line.strip()[:80]}...")
-
-            # Simplify the content *for the definition block only*
-            simplified_definition_content = line.rstrip() # Use rstrip to keep leading whitespace but remove trailing newline for definition
+            simplified_definition_content = line.rstrip()
             for pattern, replacement in DEFINITION_SIMPLIFICATION_PATTERNS:
                  try:
-                     original_def_segment = simplified_definition_content
                      if callable(replacement):
                           simplified_definition_content, _ = pattern.subn(replacement, simplified_definition_content)
                      else:
                           simplified_definition_content = pattern.sub(replacement, simplified_definition_content)
-                     # Optional: Log simplification details
-                     # if original_def_segment != simplified_definition_content:
-                     #     log.debug(f"    Simplified definition using pattern {pattern.pattern[:30]}...")
                  except Exception as e:
                       log.warning(f"Error applying definition simplification pattern {pattern.pattern}: {e}")
-
             definition_lines.append(f"{placeholder} = {simplified_definition_content}")
             placeholder_counter += 1
-
-    # If no lines met the criteria, return original content
     if not replacement_map:
         log.info("Line minification enabled, but no lines met criteria.")
         return content, 0
 
-    # Third pass: Apply the replacements to the original lines
-    new_lines = lines[:] # Create a mutable copy
-    replaced_indices = set() # Keep track of indices already replaced (though should be handled by map)
+    new_lines = lines[:]
     num_actual_replacements = 0
-
     for original_line, placeholder in replacement_map.items():
         indices_to_replace = meaningful_lines_indices.get(original_line, [])
         replacements_done_for_this_line = 0
         for index in indices_to_replace:
-            if index not in replaced_indices: # Should not happen if map keys are unique, but safe check
-                # Replace with placeholder, preserving original newline character if present
-                new_lines[index] = placeholder + ("\n" if original_line.endswith("\n") else "")
-                replaced_indices.add(index)
-                replacements_done_for_this_line += 1
+            new_lines[index] = placeholder + ("\n" if original_line.endswith("\n") else "")
+            replacements_done_for_this_line += 1
         num_actual_replacements += replacements_done_for_this_line
-        # Log detailed replacement info if needed
-        # log.debug(f"  Replaced {replacements_done_for_this_line} occurrences of line with {placeholder}")
-
-
     minified_content = "".join(new_lines)
-
-    # Prepend the definition block if definitions were created
     if definition_lines:
         definition_header = [
-            "",
-            "=" * 40,
+            "", "=" * 40,
             f"# Line Minification Definitions ({len(definition_lines)}):",
             f"# (Lines >= {min_length} chars repeated >= {min_repetitions} times, content simplified)",
             "=" * 40
         ]
-        definition_block = "\n".join(definition_header + definition_lines) + "\n\n" # Add trailing newlines
+        definition_block = "\n".join(definition_header + definition_lines) + "\n\n"
         log.info(f"Line minification: Replaced {num_actual_replacements} occurrences of {len(definition_lines)} unique long lines. Definition content simplified.")
         return definition_block + minified_content, num_actual_replacements
     else:
-        # Should not be reached if replacement_map was populated, but safe fallback
         return content, 0
 
-
-# --- Post-Processing Cleanup Function (Used by standard mode) ---
 def post_process_cleanup(content: str, cleanup_pattern: re.Pattern) -> tuple[str, int]:
-    """
-    Removes lines consisting primarily of placeholders and structural chars.
-    (Used only in standard mode)
-    """
     lines = content.splitlines(keepends=True)
     output_lines = []
     lines_removed = 0
@@ -887,266 +796,231 @@ def post_process_cleanup(content: str, cleanup_pattern: re.Pattern) -> tuple[str
 
     for i, line in enumerate(lines):
         stripped_line = line.strip()
-
-        # Always keep definition block lines, structure markers, and comments
         if (line.startswith("*LINE_REF_") or
             line.startswith("## [Compressed Block:") or
-            line.startswith("--- File:") or
+            line.startswith("--- File:") or # Keep file markers
             line.startswith("--- End File:") or
             line.startswith("===") or
-            stripped_line.startswith("#")): # Keep comments
+            stripped_line.startswith("#")):
             output_lines.append(line)
             continue
-
-        # Check if the line matches the cleanup pattern (meaning it's mostly placeholders/structure)
         if cleanup_pattern.match(line):
             log.debug(f"Post-cleanup removing line {i+1}: {line.strip()[:80]}...")
-            # Option 1: Remove the line completely (results in fewer lines)
-            # No action needed here, just don't append it
-
-            # Option 2: Replace with a marker (preserves line count somewhat, can be noisy)
-            # indent = len(line) - len(line.lstrip(' '))
-            # output_lines.append(" " * indent + "# [...]\n")
-
             lines_removed += 1
         else:
-            output_lines.append(line) # Keep the line
-
+            output_lines.append(line)
     log.info(f"Post-processing cleanup removed {lines_removed} lines containing only placeholders/structure.")
-
-    # Post-cleanup consolidation (optional, but recommended if removing lines)
     cleaned_content = "".join(output_lines)
-    # Consolidate multiple blank lines potentially created by removal
     cleaned_content = re.sub(r'\n{3,}', '\n\n', cleaned_content)
-
-    # If using markers (Option 2 above), consolidate them:
-    # cleaned_content = re.sub(r'(\n\s*# \[...\])+\n', '\n# [...]\n', cleaned_content)
-
     return cleaned_content, lines_removed
 
 
 # --- Main Function ---
 def main():
-    """ Main execution function """
     global IGNORE_PATTERNS, CODE_EXTENSIONS, INTERESTING_FILENAMES, POST_SIMPLIFICATION_PATTERNS, BLOCK_COMPRESSION_PATTERNS, SINGLE_VOICE_ID_FINDER, DEFINITION_SIMPLIFICATION_PATTERNS, PLACEHOLDER_CLEANUP_PATTERN, seen_content_hashes, DEFAULT_LARGE_LITERAL_THRESHOLD
 
-    # --- Defaults aligned with "Recommended for Max Reduction" ---
     DEFAULT_MIN_LINE_LENGTH_REC = 40
     DEFAULT_MIN_REPETITIONS_REC = 2
-    DEFAULT_MIN_CONSECUTIVE_REC = 3 # This was already the default
+    DEFAULT_MIN_CONSECUTIVE_REC = 3
 
     parser = argparse.ArgumentParser(
         description=(
-            "Generate a representation of a folder's text content. "
+            "Generate a representation of a primary input's (folder/file) text content, "
+            "optionally including an additional context folder. "
             "Default mode applies various compressions and simplifications. "
-            "Use --raw-dump for a verbatim concatenation of all files."
+            "Use --raw-dump for a verbatim concatenation."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("folder_path", help="Path to the target folder.")
+    parser.add_argument("input_path", help="Path to the primary target folder or file.")
+    parser.add_argument("--additional-context-folder", type=Path, default=None,
+                        help="Path to an additional folder whose content should also be included before global post-processing.")
     parser.add_argument("-o", "--output", help="Output file path (optional, defaults to stdout).")
-
-    # --- Mode Selection ---
     parser.add_argument("--raw-dump", action="store_true", default=False,
-                        help="Dump all files in the folder verbatim, without any simplification, filtering, or compression. Overrides most other processing options.")
-
-    # --- Standard Mode Options ---
+                        help="Dump content verbatim. Overrides most other processing options.")
+    
     st_group = parser.add_argument_group('Standard Mode Options (ignored if --raw-dump is used)')
-    st_group.add_argument("--ignore", nargs='+', default=[], help="Additional names/patterns to ignore (standard mode only).")
-    st_group.add_argument("--source-ext", nargs='+', default=[], help="Additional extensions/filenames for source code (standard mode only).")
-    st_group.add_argument("--interesting-files", nargs='+', default=[], help="Additional notable filenames for summaries (standard mode only).")
-
-    # Flags to DISABLE default standard behaviors
-    st_group.add_argument("--keep-empty", action="store_true", default=False,
-                        help="Keep files even if empty after simplification (standard mode default: skip).")
-    st_group.add_argument("--keep-duplicates", action="store_true", default=False, # Changed default to False
-                        help="Keep files even if their simplified content is duplicated (standard mode default: skip).")
-    st_group.add_argument("--no-preprocess-split-lines", action="store_false", dest="preprocess_split_lines", default=True,
-                        help="Disable pre-processing split of multi-pattern lines (standard mode default: enabled).")
-    st_group.add_argument("--no-compress-patterns", action="store_false", dest="compress_patterns", default=True,
-                        help="Disable compression of consecutive pattern lines (standard mode default: enabled).")
-    st_group.add_argument("--no-minify-lines", action="store_false", dest="minify_lines", default=True,
-                        help="Disable repeated identical long line minification (standard mode default: enabled).")
-    st_group.add_argument("--no-post-cleanup", action="store_false", dest="post_cleanup", default=True,
-                        help="Disable final removal of placeholder-only lines (standard mode default: enabled).")
-
-    # Optional standard mode flags
-    st_group.add_argument("--strip-logging", action="store_true", default=False,
-                        help="Attempt to remove common logging statements (standard mode only).")
-    st_group.add_argument("--apply-patterns", action="store_true", default=False,
-                        help="Apply detailed post-simplification patterns (UUIDs, URLs, etc.) AFTER block compression (standard mode only).")
-
-    # Standard mode arguments with modified defaults
-    st_group.add_argument("--min-consecutive", type=int, default=DEFAULT_MIN_CONSECUTIVE_REC,
-                        help="Min consecutive lines for pattern block compression (standard mode only).")
-    st_group.add_argument("--min-line-length", type=int, default=DEFAULT_MIN_LINE_LENGTH_REC,
-                        help="Min length for identical line minification (standard mode only).")
-    st_group.add_argument("--min-repetitions", type=int, default=DEFAULT_MIN_REPETITIONS_REC,
-                        help="Min repetitions for identical line minification (standard mode only).")
-    st_group.add_argument("--large-literal-threshold", type=int, default=DEFAULT_LARGE_LITERAL_THRESHOLD,
-                        help="Min lines in list/dict for literal compression (standard mode, skipped if pattern compression enabled).")
-
-    # --- General Options ---
-    parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-                        help="Set logging level.")
-
+    st_group.add_argument("--ignore", nargs='+', default=[], help="Names/patterns to ignore (folder processing).")
+    st_group.add_argument("--source-ext", nargs='+', default=[], help="Extensions/filenames for source code (folder processing).")
+    st_group.add_argument("--interesting-files", nargs='+', default=[], help="Notable filenames for summaries (folder processing).")
+    st_group.add_argument("--keep-empty", action="store_true", default=False, help="Keep files even if empty after simplification (folder processing default: skip).")
+    st_group.add_argument("--keep-duplicates", action="store_true", default=False, help="Keep files even if simplified content is duplicated (folder processing default: skip).")
+    st_group.add_argument("--no-preprocess-split-lines", action="store_false", dest="preprocess_split_lines", default=True, help="Disable pre-processing split of multi-pattern lines.")
+    st_group.add_argument("--no-compress-patterns", action="store_false", dest="compress_patterns", default=True, help="Disable compression of consecutive pattern lines.")
+    st_group.add_argument("--no-minify-lines", action="store_false", dest="minify_lines", default=False, help="Disable repeated identical long line minification.")
+    st_group.add_argument("--no-post-cleanup", action="store_false", dest="post_cleanup", default=True, help="Disable final removal of placeholder-only lines.")
+    st_group.add_argument("--strip-logging", action="store_true", default=False, help="Attempt to remove common logging statements.")
+    st_group.add_argument("--apply-patterns", action="store_true", default=False, help="Apply detailed post-simplification patterns.")
+    st_group.add_argument("--min-consecutive", type=int, default=DEFAULT_MIN_CONSECUTIVE_REC, help="Min consecutive lines for pattern block compression.")
+    st_group.add_argument("--min-line-length", type=int, default=DEFAULT_MIN_LINE_LENGTH_REC, help="Min length for identical line minification.")
+    st_group.add_argument("--min-repetitions", type=int, default=DEFAULT_MIN_REPETITIONS_REC, help="Min repetitions for identical line minification.")
+    st_group.add_argument("--large-literal-threshold", type=int, default=DEFAULT_LARGE_LITERAL_THRESHOLD, help="Min lines in list/dict for literal compression (skipped if pattern compression enabled).")
+    
+    parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Set logging level.")
     args = parser.parse_args()
 
-    # --- Setup ---
     log.setLevel(args.log_level.upper())
-    logging.getLogger().setLevel(args.log_level.upper()) # Ensure root logger level is also set
-    seen_content_hashes.clear() # Ensure fresh state for each run
+    logging.getLogger().setLevel(args.log_level.upper())
+    seen_content_hashes.clear() # Crucial for consistent behavior if script is run multiple times in one session
     total_bytes_written = 0
 
-    target_folder_path = Path(args.folder_path)
-    if not target_folder_path.is_dir():
-        log.critical(f"Error: Folder not found or not a directory: '{args.folder_path}'")
+    primary_input_path_obj = Path(args.input_path)
+    if not primary_input_path_obj.exists():
+        log.critical(f"Error: Primary input path not found: '{args.input_path}'")
         sys.exit(1)
-    resolved_path = target_folder_path.resolve()
+    if not (primary_input_path_obj.is_dir() or primary_input_path_obj.is_file()):
+        log.critical(f"Error: Primary input path '{args.input_path}' is neither a directory nor a file.")
+        sys.exit(1)
+    
+    resolved_primary_path = primary_input_path_obj.resolve()
+    is_primary_input_directory = resolved_primary_path.is_dir()
 
-    # --- Print Config ---
+    resolved_additional_context_path = None
+    if args.additional_context_folder:
+        additional_context_path_obj = Path(args.additional_context_folder)
+        if not additional_context_path_obj.is_dir(): # Must be a directory
+            log.warning(f"Warning: Additional context path '{args.additional_context_folder}' is not a directory. It will be ignored.")
+        else:
+            resolved_additional_context_path = additional_context_path_obj.resolve()
+            if resolved_additional_context_path == resolved_primary_path and is_primary_input_directory:
+                log.warning(f"Warning: Additional context folder is the same as the primary input folder. It will be processed once as primary.")
+                resolved_additional_context_path = None # Avoid double processing
+
     print("-" * 40, file=sys.stderr)
-    print(f"Processing folder: {resolved_path}", file=sys.stderr)
+    print(f"Processing primary {'folder' if is_primary_input_directory else 'file'}: {resolved_primary_path}", file=sys.stderr)
+    if resolved_additional_context_path:
+        print(f"Including additional context folder: {resolved_additional_context_path}", file=sys.stderr)
     print(f"Output target: {'Stdout' if not args.output else args.output}", file=sys.stderr)
     print(f"Log Level: {args.log_level.upper()}", file=sys.stderr)
     print(f"Mode: {'RAW DUMP' if args.raw_dump else 'Standard (Compression/Simplification)'}", file=sys.stderr)
 
-    if not args.raw_dump:
-        # Determine effective skip values based on flags for standard mode
-        effective_skip_empty = not args.keep_empty
-        effective_skip_duplicates = not args.keep_duplicates # Default is now skip=True
+    effective_skip_empty = not args.keep_empty
+    effective_skip_duplicates = not args.keep_duplicates
 
-        print(f"  Skip empty: {effective_skip_empty} ({'DEFAULT' if effective_skip_empty else 'Disabled (--keep-empty)'})", file=sys.stderr)
-        print(f"  Skip duplicates: {effective_skip_duplicates} ({'DEFAULT' if effective_skip_duplicates else 'Disabled (--keep-duplicates)'})", file=sys.stderr)
+    if not args.raw_dump:
+        print(f"  Skip empty (folder processing): {effective_skip_empty} ({'DEFAULT' if effective_skip_empty else 'Disabled (--keep-empty)'})", file=sys.stderr)
+        print(f"  Skip duplicates (folder processing): {effective_skip_duplicates} ({'DEFAULT' if effective_skip_duplicates else 'Disabled (--keep-duplicates)'})", file=sys.stderr)
         print(f"  Strip logging: {args.strip_logging} ({'Enabled' if args.strip_logging else 'Disabled (DEFAULT)'})", file=sys.stderr)
-        print(f"  Pre-process split lines: {args.preprocess_split_lines} ({'DEFAULT' if args.preprocess_split_lines else 'Disabled (--no-preprocess-split-lines)'})", file=sys.stderr)
-        print(f"  Compress pattern blocks: {args.compress_patterns} ({'DEFAULT' if args.compress_patterns else 'Disabled (--no-compress-patterns)'})", file=sys.stderr)
+        print(f"  Pre-process split lines: {args.preprocess_split_lines} ({'DEFAULT' if args.preprocess_split_lines else 'Disabled'})", file=sys.stderr)
+        print(f"  Compress pattern blocks: {args.compress_patterns} ({'DEFAULT' if args.compress_patterns else 'Disabled'})", file=sys.stderr)
         if args.compress_patterns: print(f"    Min consecutive lines: {args.min_consecutive}", file=sys.stderr)
         print(f"  Apply detailed patterns: {args.apply_patterns} ({'Enabled' if args.apply_patterns else 'Disabled (DEFAULT)'})", file=sys.stderr)
-        print(f"  Minify identical lines: {args.minify_lines} ({'DEFAULT' if args.minify_lines else 'Disabled (--no-minify-lines)'})", file=sys.stderr)
+        print(f"  Minify identical lines: {args.minify_lines} ({'DEFAULT (Enabled)' if args.minify_lines else 'Disabled (--no-minify-lines)'})", file=sys.stderr)
         if args.minify_lines: print(f"    Min line length: {args.min_line_length}, Min repetitions: {args.min_repetitions}", file=sys.stderr)
-        print(f"  Post-process cleanup: {args.post_cleanup} ({'DEFAULT' if args.post_cleanup else 'Disabled (--no-post-cleanup)'})", file=sys.stderr)
-        literal_compression_status = 'DISABLED (Pattern compression enabled)' if args.compress_patterns else f'ENABLED (threshold: {args.large_literal_threshold})'
-        print(f"  Large literal compression: {literal_compression_status}", file=sys.stderr)
+        print(f"  Post-process cleanup: {args.post_cleanup} ({'DEFAULT' if args.post_cleanup else 'Disabled'})", file=sys.stderr)
+        literal_comp_status = 'DISABLED (Pattern compression enabled)' if args.compress_patterns else f'ENABLED (threshold: {args.large_literal_threshold})'
+        print(f"  Large literal compression: {literal_comp_status}", file=sys.stderr)
     else:
-         print("  (Standard mode options are ignored in raw dump mode)", file=sys.stderr)
-
+         print("  (Standard mode options are ignored in raw dump mode, except for multiple input paths)", file=sys.stderr)
     print("-" * 40, file=sys.stderr)
 
-    output_handle = None
-    output_path = None
-    buffer = io.StringIO()
-    output_content_to_write = "" # Initialize
+    output_handle = None; output_path = None; buffer = io.StringIO(); output_content_to_write = ""
 
     try:
         # --- Header ---
+        header_desc = f"Primary {'folder' if is_primary_input_directory else 'file'}: {resolved_primary_path}"
+        if resolved_additional_context_path:
+            header_desc += f" | Additional Context: {resolved_additional_context_path}"
+        
+        header_options_summary = (
+            f"skip_empty(folder)={effective_skip_empty}, "
+            f"skip_duplicates(folder)={effective_skip_duplicates}, "
+            f"preprocess_split={args.preprocess_split_lines}, "
+            f"compress_patterns={args.compress_patterns} (min={args.min_consecutive}), "
+            f"apply_patterns={args.apply_patterns}, "
+            f"minify_lines={args.minify_lines}, "
+            f"post_cleanup={args.post_cleanup}"
+        )
         if args.raw_dump:
-            header_lines = [
-                f"# RAW DUMP of folder: {resolved_path}",
-                f"# Generated by folder_to_text.py --raw-dump",
-                "=" * 40, ""
-            ]
+            header_lines = [f"# RAW DUMP of {header_desc}", "# Generated by folder_to_text.py --raw-dump", "=" * 40, ""]
         else:
-            header_lines = [
-                f"# Compressed Representation of: {resolved_path}",
-                f"# Generated by folder_to_text.py (Standard Mode)",
-                f"# Options Effective: skip_empty={effective_skip_empty}, skip_duplicates={effective_skip_duplicates}, preprocess_split={args.preprocess_split_lines}, compress_patterns={args.compress_patterns} (min={args.min_consecutive}), apply_patterns={args.apply_patterns}, minify_lines={args.minify_lines}, post_cleanup={args.post_cleanup}",
-                "# (Defaults provide maximum reduction)",
-                "=" * 40, ""
-            ]
+            header_lines = [f"# Compressed Representation of {header_desc}", "# Generated by folder_to_text.py (Standard Mode)", f"# Options Effective: {header_options_summary}", "=" * 40, ""]
         for line in header_lines: buffer.write(line + "\n")
 
         # --- Main Processing Logic ---
         if args.raw_dump:
-            # --- Raw Dump Mode ---
-            log.info("Starting raw folder dump...")
-            process_folder_raw(str(resolved_path), buffer)
-            log.info("Finished raw folder dump.")
+            log.info(f"Starting raw dump...")
+            process_folder_raw(str(resolved_primary_path), buffer, 
+                               str(resolved_additional_context_path) if resolved_additional_context_path else None)
+            log.info(f"Finished raw dump.")
+        else: # Standard Mode
+            current_ignore = IGNORE_PATTERNS.copy(); current_ignore.update(args.ignore)
+            current_code_ext = CODE_EXTENSIONS.copy(); current_code_ext.update(args.source_ext)
+            current_interesting = INTERESTING_FILENAMES.copy(); current_interesting.update(args.interesting_files)
+
+            # Step 1a: Process Primary Input
+            log.info(f"Processing primary input: {resolved_primary_path} (Step 1a)...")
+            if is_primary_input_directory:
+                process_folder_contents(
+                    resolved_primary_path, buffer, current_ignore, current_code_ext, current_interesting,
+                    effective_skip_empty, args.strip_logging, effective_skip_duplicates,
+                    args.large_literal_threshold, args.compress_patterns
+                )
+            else: # Primary input is a single file
+                process_single_file_content(
+                    resolved_primary_path, buffer, args.strip_logging,
+                    args.large_literal_threshold, args.compress_patterns
+                )
+            log.info("Finished processing primary input.")
+
+            # Step 1b: Process Additional Context Folder (if any)
+            if resolved_additional_context_path:
+                log.info(f"Processing additional context folder: {resolved_additional_context_path} (Step 1b)...")
+                # For additional context, we generally want to include everything not explicitly ignored.
+                # skip_empty and skip_duplicates will apply based on args, using the shared seen_content_hashes.
+                buffer.write(f"\n{'=' * 10} STARTING ADDITIONAL CONTEXT: {resolved_additional_context_path.name} {'=' * 10}\n\n")
+                process_folder_contents(
+                    resolved_additional_context_path, buffer, current_ignore, current_code_ext, current_interesting,
+                    effective_skip_empty, args.strip_logging, effective_skip_duplicates,
+                    args.large_literal_threshold, args.compress_patterns,
+                    is_additional_context=True
+                )
+                buffer.write(f"\n{'=' * 10} FINISHED ADDITIONAL CONTEXT: {resolved_additional_context_path.name} {'=' * 10}\n\n")
+                log.info("Finished processing additional context folder.")
+        
+        # Retrieve combined content for global post-processing (if not raw dump)
+        if not args.raw_dump:
             buffer.seek(0)
-            output_content_to_write = buffer.getvalue() # Get content directly
+            processed_content = buffer.getvalue() # This now contains content from primary and optionally additional context
+            final_output_content = processed_content
+            num_lines_expanded, num_pattern_replacements, num_blocks_compressed, num_lines_minified, num_lines_cleaned_up = 0,0,0,0,0
 
-        else:
-            # --- Standard Mode ---
-            current_ignore_patterns = IGNORE_PATTERNS.copy(); current_ignore_patterns.update(args.ignore)
-            current_code_extensions = CODE_EXTENSIONS.copy(); current_code_extensions.update(args.source_ext)
-            current_interesting_files = INTERESTING_FILENAMES.copy(); current_interesting_files.update(args.interesting_files)
-
-            # Step 1: Process Folder (Initial simplification, filtering)
-            log.info("Starting standard folder processing (Step 1)...")
-            process_folder(
-                str(resolved_path), buffer, current_ignore_patterns, current_code_extensions,
-                current_interesting_files,
-                skip_empty=effective_skip_empty,
-                strip_logging=args.strip_logging,
-                skip_duplicates=effective_skip_duplicates,
-                large_literal_threshold=args.large_literal_threshold,
-                compress_patterns_enabled=args.compress_patterns
-            )
-            log.info("Finished initial folder processing.")
-
-            # Retrieve content for further steps
-            buffer.seek(0)
-            processed_content = buffer.getvalue()
-            final_output_content = processed_content # Start with initial content
-            num_lines_expanded = 0
-            num_pattern_replacements = 0
-            num_blocks_compressed = 0
-            num_lines_minified = 0
-            num_lines_cleaned_up = 0
-
-            # Subsequent optional steps modify final_output_content
-
-            # Step 2: Pre-process - Expand Multi-Pattern Lines
+            # Step 2: Pre-process - Expand Multi-Pattern Lines (applied to combined content)
             if args.preprocess_split_lines and final_output_content.strip():
                 log.info("Pre-processing: Expanding multi-pattern lines (Step 2)...")
-                final_output_content, num_lines_expanded = expand_multi_pattern_lines(
-                    final_output_content, SINGLE_VOICE_ID_FINDER, "VOICE_ID"
-                )
-                log.info("Finished expanding multi-pattern lines.")
-            else:
-                log.debug("Skipping Step 2: Pre-process split lines (disabled or empty content)")
+                final_output_content, num_lines_expanded = expand_multi_pattern_lines(final_output_content, SINGLE_VOICE_ID_FINDER, "VOICE_ID")
+            else: log.debug("Skipping Step 2: Pre-process split lines (disabled or empty content)")
 
             # Step 3: Compress Pattern Blocks
             if args.compress_patterns and final_output_content.strip():
                  log.info("Compressing consecutive pattern blocks (Step 3)...")
-                 final_output_content, num_blocks_compressed = compress_pattern_blocks(
-                     final_output_content, BLOCK_COMPRESSION_PATTERNS, args.min_consecutive
-                 )
-                 log.info("Finished compressing pattern blocks.")
-            else:
-                log.debug("Skipping Step 3: Compress pattern blocks (disabled or empty content)")
+                 final_output_content, num_blocks_compressed = compress_pattern_blocks(final_output_content, BLOCK_COMPRESSION_PATTERNS, args.min_consecutive)
+            else: log.debug("Skipping Step 3: Compress pattern blocks (disabled or empty content)")
 
             # Step 4: Apply Post-Simplification Patterns
             if args.apply_patterns and final_output_content.strip():
                 log.info("Applying detailed post-simplification patterns (Step 4)...")
-                final_output_content, num_pattern_replacements = apply_post_simplification_patterns(
-                    final_output_content, POST_SIMPLIFICATION_PATTERNS
-                )
-                log.info("Finished applying detailed post-simplification patterns.")
-            else:
-                log.debug("Skipping Step 4: Apply detailed patterns (disabled or empty content)")
+                final_output_content, num_pattern_replacements = apply_post_simplification_patterns(final_output_content, POST_SIMPLIFICATION_PATTERNS)
+            else: log.debug("Skipping Step 4: Apply detailed patterns (disabled or empty content)")
 
             # Step 5: Minify Identical Lines
             if args.minify_lines and final_output_content.strip():
                 log.info("Minifying repeated identical lines (Step 5)...")
-                final_output_content, num_lines_minified = minify_repeated_lines(
-                    final_output_content, args.min_line_length, args.min_repetitions
-                )
-                log.info("Finished minifying identical lines.")
+                final_output_content, num_lines_minified = minify_repeated_lines(final_output_content, args.min_line_length, args.min_repetitions)
             else:
-                log.debug("Skipping Step 5: Minify identical lines (disabled or empty content)")
+                log.info("Skipping Step 5: Minify identical lines (flag disabled or content empty)")
+                log.debug(f"minify_lines: {args.minify_lines}, content empty: {not final_output_content.strip()}")
 
             # Step 6: Post-Process Cleanup
             if args.post_cleanup and final_output_content.strip():
                  log.info("Applying post-processing cleanup (Step 6)...")
-                 final_output_content, num_lines_cleaned_up = post_process_cleanup(
-                     final_output_content, PLACEHOLDER_CLEANUP_PATTERN
-                 )
-                 log.info("Finished post-processing cleanup.")
-            else:
-                 log.debug("Skipping Step 6: Post-process cleanup (disabled or empty content)")
-
-            output_content_to_write = final_output_content # Final result after all steps
+                 final_output_content, num_lines_cleaned_up = post_process_cleanup(final_output_content, PLACEHOLDER_CLEANUP_PATTERN)
+            else: log.debug("Skipping Step 6: Post-process cleanup (disabled or empty content)")
+            
+            output_content_to_write = final_output_content
+        else: # Raw dump mode - content already in buffer
+            buffer.seek(0)
+            output_content_to_write = buffer.getvalue()
 
 
         # --- Write Final Output ---
@@ -1154,13 +1028,14 @@ def main():
         if args.output:
             output_path = Path(args.output).resolve()
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_handle = open(output_path, 'w', encoding='utf-8')
-            log.debug(f"Opening output file: {output_path}")
-        else:
-            output_handle = sys.stdout
-            log.debug("Using stdout for output.")
+            with open(output_path, 'w', encoding='utf-8') as output_handle:
+                output_handle.write(output_content_to_write)
+            log.debug(f"Opened and wrote to output file: {output_path}")
+        else: # stdout
+            sys.stdout.write(output_content_to_write)
+            output_handle = sys.stdout # For finally block
+            log.debug("Wrote to stdout for output.")
 
-        output_handle.write(output_content_to_write)
         total_bytes_written = len(output_content_to_write.encode('utf-8'))
         log.info("Finished writing output.")
 
@@ -1169,11 +1044,13 @@ def main():
         print("Processing complete.", file=sys.stderr)
         print(f"Mode: {'RAW DUMP' if args.raw_dump else 'Standard'}", file=sys.stderr)
         if not args.raw_dump:
-             if args.preprocess_split_lines: print(f"  Line expansion pre-processing expanded {num_lines_expanded} lines.", file=sys.stderr)
-             if args.compress_patterns: print(f"  Pattern block compression created {num_blocks_compressed} summary lines.", file=sys.stderr)
-             if args.apply_patterns: print(f"  Detailed pattern application made {num_pattern_replacements} replacements.", file=sys.stderr)
-             if args.minify_lines: print(f"  Identical line minification replaced {num_lines_minified} line occurrences.", file=sys.stderr)
-             if args.post_cleanup: print(f"  Post-processing cleanup removed {num_lines_cleaned_up} lines.", file=sys.stderr)
+             if args.preprocess_split_lines: print(f"  Line expansion: {num_lines_expanded} lines expanded.", file=sys.stderr)
+             if args.compress_patterns: print(f"  Pattern block compression: {num_blocks_compressed} blocks created.", file=sys.stderr)
+             if args.apply_patterns: print(f"  Detailed pattern application: {num_pattern_replacements} replacements.", file=sys.stderr)
+             if args.minify_lines and num_lines_minified > 0 : print(f"  Identical line minification: {num_lines_minified} occurrences replaced.", file=sys.stderr)
+             elif not args.minify_lines : print(f"  Identical line minification: SKIPPED (disabled).", file=sys.stderr)
+             else: print(f"  Identical line minification: No lines met criteria for replacement.", file=sys.stderr)
+             if args.post_cleanup: print(f"  Post-processing cleanup: {num_lines_cleaned_up} lines removed.", file=sys.stderr)
 
         if args.output and output_path: print(f"Total bytes written to {output_path}: {total_bytes_written}", file=sys.stderr)
         else: print(f"Total bytes written to stdout: {total_bytes_written}", file=sys.stderr)
@@ -1191,13 +1068,7 @@ def main():
         sys.exit(1)
     finally:
         if buffer: buffer.close()
-        if args.output and output_handle and output_handle is not sys.stdout:
-            try:
-                output_handle.close()
-                log.debug(f"Closed output file: {output_path}")
-            except Exception as e:
-                log.error(f"Error closing output file '{args.output}': {e}")
-
+        # output_handle is managed by 'with open' or is sys.stdout, so no explicit close needed here for file case.
 
 if __name__ == "__main__":
     main()
