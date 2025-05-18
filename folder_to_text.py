@@ -23,6 +23,7 @@
 #    python folder_to_text.py /path/to/project --raw-dump -o raw_dump.txt
 
 
+
 import os
 import re
 import argparse
@@ -34,6 +35,8 @@ import logging
 import hashlib
 import io
 from typing import Dict, List, Optional, Tuple, Any, Union, Callable
+
+FILE_HEADER_RE = re.compile(r"^--- File: (.*) ---$")
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(funcName)s: %(message)s', stream=sys.stderr)
@@ -606,6 +609,7 @@ def minify_repeated_lines(content: str, min_length: int, min_repetitions: int) -
         is_structural_or_placeholder = (stripped_line.startswith(("--- File:", "--- End File:", "#", "===", "*LINE_REF_", "## [Compressed Block:")) or
             any(re.match(pat, stripped_line) for pat in (r'^\*VOICE:.*\*$', r'^\*UUID\*$', r'^\*...\*$')) or not stripped_line)
         if len(stripped_line) >= min_length and not is_structural_or_placeholder:
+            line_content_key = stripped_line.rstrip() # Use the stripped line as the key
             line_counts[line_content_key] += 1
             if line_content_key not in meaningful_lines_indices: meaningful_lines_indices[line_content_key] = []
             meaningful_lines_indices[line_content_key].append(i)
@@ -679,7 +683,7 @@ def post_process_cleanup(content: str, cleanup_pattern: re.Pattern) -> tuple[str
 # --- Main Function ---
 def main():
     global DEFAULT_IGNORE_PATTERNS, BASE_IGNORE_PATTERNS, TEST_IGNORE_PATTERNS, CODE_EXTENSIONS, INTERESTING_FILENAMES # Allow access
-    DEFAULT_MIN_LINE_LENGTH_REC, DEFAULT_MIN_REPETITIONS_REC, DEFAULT_MIN_CONSECUTIVE_REC = 40, 2, 3
+    DEFAULT_MIN_LINE_LENGTH_REC, DEFAULT_MIN_REPETITIONS_REC, DEFAULT_MIN_CONSECUTIVE_REC = 140, 2, 4
 
     parser = argparse.ArgumentParser( description="Generate a representation of a folder's text content.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("folder_path", help="Path to the target folder.")
