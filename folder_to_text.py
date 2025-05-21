@@ -397,7 +397,6 @@ def process_folder(
 
         # Filter ignored directories (modify dirnames in place)
         original_dir_count = len(dirnames)
-        # *LINE_REF_1* (from original input, slightly different context but similar logic)
         dirnames[:] = [d for d in dirnames if d not in ignore_set and not d.startswith('.') and not any(Path(d).match(p) for p in ignore_set if '*' in p or '?' in p)]
         if len(dirnames) < original_dir_count:
             log.debug(f"Filtered {original_dir_count - len(dirnames)} subdirectories in {current_rel_path}")
@@ -462,7 +461,6 @@ def process_folder(
                     
                     hash_before = hashlib.sha256(content.encode('utf-8')).hexdigest()
                     
-                    # --- MODIFICATION: Special handling for JSON files ---
                     if file_ext == '.json':
                         log.debug(f"Attempting to generate sample for JSON file: {rel_path}")
                         sample_str, status = generate_json_sample(content)
@@ -474,50 +472,46 @@ def process_folder(
                             report_data[file_id_for_report]['json_sampled'] += 1
                         else:
                             log.warning(f"Could not generate sample for {rel_path} (status: {status}). Falling back to standard simplification.")
-                            # Fallback: process as regular source code
                             simplified_content = simplify_source_code(content, strip_logging, large_literal_threshold, compress_patterns_enabled)
                     else:
-                        # Standard simplification for other source files
                         simplified_content = simplify_source_code(content, strip_logging, large_literal_threshold, compress_patterns_enabled)
-                    # --- END MODIFICATION ---
 
                     hash_after = hashlib.sha256(simplified_content.encode('utf-8')).hexdigest()
                     
                     is_simplified = hash_before != hash_after
                     is_empty_after_simplification = not simplified_content.strip()
                     
-                    content_hash = hash_after # Use hash of the (potentially sampled) content
+                    content_hash = hash_after 
                     is_duplicate = False
 
-                    if is_simplified and not is_empty_after_simplification and not is_json_sample: # Don't count JSON sampling as "simplification" in this metric
+                    if is_simplified and not is_empty_after_simplification and not is_json_sample: 
                         report_data[file_id_for_report]['simplified'] += 1
                     
                     if skip_empty and is_empty_after_simplification:
                         log.info(f"Skipping empty file (after simplification/sampling): {rel_path}")
                         report_data[file_id_for_report]['skipped_empty'] += 1
-                        continue # Skip to next file
+                        continue 
 
                     if skip_duplicates and not is_empty_after_simplification:
                         if content_hash in seen_content_hashes:
                             is_duplicate = True
                             log.info(f"Skipping duplicate file (based on simplified/sampled content): {rel_path}")
                             report_data[file_id_for_report]['skipped_duplicate'] += 1
-                            continue # Skip to next file
+                            continue 
                         else:
                             seen_content_hashes.add(content_hash)
                             log.debug(f"Adding new content hash: {content_hash[:8]}... for {rel_path}")
                     
-                    # If we reach here, the file content will be included
                     if dir_header and not has_written_dir_header:
-                        write_to_buffer(dir_header.strip("\n")) # remove then re-add \n via write_to_buffer
+                        write_to_buffer(dir_header.strip("\n")) 
                         has_written_dir_header = True
                     
                     report_data[file_id_for_report]['contributed'] += 1
-                    write_to_buffer(file_info_prefix + " ---") # Standard header format
-                    if is_empty_after_simplification: # Should only happen if skip_empty is false
+                    write_to_buffer(file_info_prefix + " ---") 
+                    if is_empty_after_simplification: 
                         write_to_buffer("### This file became empty after simplification. ###")
                     else:
-                        write_to_buffer(simplified_content.strip()) # Ensure no leading/trailing newlines from content itself
+                        write_to_buffer(simplified_content.strip()) 
                     write_to_buffer(f"--- End File: {rel_path} ---")
 
                 except OSError as e:
@@ -535,29 +529,33 @@ def process_folder(
         if other_text_filenames:
             summary = summarize_other_files(other_text_filenames, code_extensions_set, interesting_filenames_set)
             if summary:
-                # Determine proper indentation based on directory depth
                 indent_level = len(current_rel_path.parts) if str(current_rel_path) != '.' else 0
                 indent = "  " * indent_level if indent_level > 0 else ""
                 
                 summary_line = f"{indent}{summary}"
                 log.debug(f"Adding summary for {current_rel_path}: {summary_line}")
 
-                # Ensure there's a blank line before a summary if it follows file content
-                # or another summary, but not if it's right after a directory header.
-                buffer.seek(0, io.SEEK_END)
-                current_pos = buffer.tell()
-                if current_pos > 0: # Check if buffer is not empty
-                    buffer.seek(max(0, current_pos - 200)) # Read last part to check context
+                # --- MODIFICATION START: Fix buffer cursor management ---
+                buffer.seek(0, io.SEEK_END) # Ensure original_end_pos reflects the true end of the buffer
+                original_end_pos = buffer.tell()
+
+                if original_end_pos > 0: # Check if buffer is not empty
+                    # We are at original_end_pos. Seek back from here to read the tail portion.
+                    buffer.seek(max(0, original_end_pos - 200))
                     last_part = buffer.read()
-                    # Don't add extra newline if previous line was already a dir header for this dir or empty
+                    # CRITICAL: After reading, the cursor is NOT at original_end_pos.
+                    # Restore cursor to the true end of the buffer before any new writes.
+                    buffer.seek(original_end_pos)
+
+                    # Check context to decide if a separating newline is needed
                     if not last_part.strip().endswith(f"Directory: {current_rel_path} {'=' * 10}") and \
                        not last_part.endswith("\n\n"):
                         write_to_buffer("") # Add a separating newline
 
-                write_to_buffer(summary_line)
-                # Add a blank line after the summary for better separation,
-                # unless it's the very end of processing (which is hard to tell here)
-                write_to_buffer("")
+                write_to_buffer(summary_line) # This will now append correctly
+                # Add a blank line after the summary for better separation
+                write_to_buffer("")           # This will now append correctly
+                # --- MODIFICATION END ---
 
 
 # --- Raw Dump Functions (largely unchanged, included for completeness) ---
