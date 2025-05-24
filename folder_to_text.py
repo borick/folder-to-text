@@ -21,14 +21,17 @@ from typing import Dict, List, Optional, Tuple, Any, Union, Callable
 # --- Constants and Patterns (many are unchanged, will be included in the full script) ---
 FILE_HEADER_RE = re.compile(r"^--- File: (.*) ---$")
 
-logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(funcName)s: %(message)s', stream=sys.stderr)
-log = logging.getLogger(__name__)
+# Configure logging FIRST, then get the logger instance.
+# The level set here will be the default if --log-level is not provided or if other modules log.
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(name)s:%(funcName)s:%(lineno)d: %(message)s', stream=sys.stderr)
+log = logging.getLogger(__name__) # Get a logger specific to this module
 
 # --- Default Ignore Patterns ---
 BASE_IGNORE_PATTERNS = {
     '.git', '__pycache__', '.svn', '.hg', '.idea', '.vscode', 'node_modules',
     'build', 'dist', 'target', 'venv', '.venv', 'env', 'envs', 'conda', 'anaconda3', 'AppData',
     '.DS_Store', 'Thumbs.db',
+    'discord', # <--- THIS IS THE KEY IGNORE FOR THE USER'S PROBLEM
     # Common binary/archive/media types
     '*.zip', '*.gz', '*.tar', '*.rar', '*.7z',
     '*.class', '*.jar', '*.exe', '*.dll', '*.so', '*.o', '*.a', '*.lib', '*.pyc', '*.pyo',
@@ -512,7 +515,7 @@ def process_single_file_standard(
 
 
 def process_folder(
-    target_folder_str: str, # Renamed from target_folder to avoid conflict with Path object
+    target_folder_str: str,
     buffer: io.StringIO,
     ignore_set: set,
     code_extensions_set: set,
@@ -521,77 +524,148 @@ def process_folder(
     strip_logging: bool,
     skip_duplicates: bool,
     large_literal_threshold: int,
-    disable_literal_compression: bool, # True if pattern compression is on
+    disable_literal_compression: bool,
     report_data: Dict[str, Counter]
 ):
     def write_to_buffer(text): buffer.write(text + "\n")
 
-    target_path = Path(target_folder_str).resolve() # Use target_folder_str to create Path object
+    target_path = Path(target_folder_str).resolve()
     if not target_path.is_dir():
         log.error(f"Input to process_folder is not a directory: {target_path}")
         return
 
-    log.debug(f"Starting folder walk: {target_path} (Standard Mode)")
+    log.debug(f"--- Starting Standard Folder Walk ---")
+    log.debug(f"Root: {target_path}")
+    log.debug(f"Effective Ignore Set: {sorted(list(ignore_set))}")
+    log.debug(f"Effective Code Extensions: {code_extensions_set}")
     log.debug(f"Skips: empty={skip_empty}, duplicates={skip_duplicates}")
     log.debug(f"Strip logging: {strip_logging}")
-    log.debug(f"Disable large literal compression (if pattern compression is on): {disable_literal_compression}")
+    log.debug(f"Disable large literal compression (if pattern comp is on): {disable_literal_compression}")
 
-    # Walk through the directory
-    for dirpath, dirnames, filenames in os.walk(target_path, topdown=True, onerror=lambda e: log.warning(f"Cannot access {e.filename} - {e}")):
-        current_path = Path(dirpath)
+    for dirpath_str, dirnames_orig_iter, filenames_orig_iter in os.walk(target_path, topdown=True, onerror=lambda e: log.warning(f"OS Walk Error: Cannot access {e.filename} - {e}")):
+        current_walk_path = Path(dirpath_str)
+        dirnames_orig = sorted(list(dirnames_orig_iter)) # Sort for consistent processing and logging
+        filenames_orig = sorted(list(filenames_orig_iter))
+
         try:
-            # Use target_path (the root of this process_folder call) for relative path calculation
-            current_rel_path = current_path.relative_to(target_path)
-        except ValueError: # pragma: no cover (should not happen if target_path is an ancestor)
-            log.warning(f"Cannot get relative path for {current_path} relative to {target_path}. Skipping.")
-            dirnames[:] = [] # Don't recurse further into this path
+            current_rel_path_from_target = current_walk_path.relative_to(target_path)
+        except ValueError:
+            log.warning(f"Path Error: Cannot get relative path for '{current_walk_path}' "
+                        f"relative to walk root '{target_path}'. Skipping this path.")
+            dirnames_orig_iter[:] = [] # Modify the list os.walk uses
             continue
 
-        # Filter ignored directories (modify dirnames in place)
-        original_dir_count = len(dirnames)
-        dirnames[:] = [d for d in dirnames if d not in ignore_set and not d.startswith('.') and not any(Path(d).match(p) for p in ignore_set if '*' in p or '?' in p)]
-        if len(dirnames) < original_dir_count:
-            log.debug(f"Filtered {original_dir_count - len(dirnames)} subdirectories in {current_rel_path}")
+        log.debug(f"\nDIR_WALK: Processing directory '{current_rel_path_from_target}' (Abs: '{current_walk_path}')")
+        log.debug(f"DIR_WALK: Original subdirectories before filtering: {dirnames_orig}")
 
-        log.debug(f"Processing directory: {current_rel_path} (Files: {len(filenames)}, Subdirs: {len(dirnames)})")
+        dirs_to_remove_from_walk = []
+        for d_name in dirnames_orig:
+            potential_subdir_rel_to_target = current_rel_path_from_target / d_name
 
-        filenames.sort()
-        dirnames.sort() # Ensure deterministic order
-
-        source_files_to_process: List[Tuple[Path, Path, str]] = [] # rel_path_to_root, full_path, extension
-        other_text_filenames: List[str] = []
-
-        for filename in filenames:
-            if filename in ignore_set or any(Path(filename).match(p) for p in ignore_set if '*' in p or '?' in p):
+            if d_name in ignore_set:
+                log.debug(f"  DIR_IGNORE (Exact Name): '{d_name}' in '{current_rel_path_from_target}'. Marking for removal from walk.")
+                dirs_to_remove_from_walk.append(d_name)
                 continue
-            if filename.startswith('.') and filename.lower() not in interesting_filenames_set and filename not in code_extensions_set:
+            if d_name.startswith('.') and d_name not in interesting_filenames_set:
+                log.debug(f"  DIR_IGNORE (Hidden): '{d_name}' in '{current_rel_path_from_target}'. Marking for removal from walk.")
+                dirs_to_remove_from_walk.append(d_name)
                 continue
 
-            file_path = current_path / filename
-            if not file_path.is_file(): 
+            is_glob_ignored_path = False
+            for p_glob in ignore_set:
+                if not ('*' in p_glob or '?' in p_glob or '[' in p_glob): continue
+                if potential_subdir_rel_to_target.match(p_glob):
+                    log.debug(f"  DIR_IGNORE (Glob on RelPath): '{potential_subdir_rel_to_target}' matched by glob '{p_glob}'. Marking for removal from walk.")
+                    is_glob_ignored_path = True
+                    break
+            if is_glob_ignored_path:
+                dirs_to_remove_from_walk.append(d_name)
+                continue
+            
+            log.debug(f"  DIR_KEEP: '{d_name}' in '{current_rel_path_from_target}'. Will be explored by os.walk if not removed by name.")
+
+        # Modify the list that os.walk uses for recursion
+        for d_to_remove in dirs_to_remove_from_walk:
+            if d_to_remove in dirnames_orig_iter: # Check if still present before removing
+                 dirnames_orig_iter.remove(d_to_remove)
+        
+        log.debug(f"DIR_WALK: Subdirectories os.walk will explore next in '{current_rel_path_from_target}': {sorted(list(dirnames_orig_iter))}")
+
+
+        source_files_to_process: List[Tuple[Path, Path, str]] = [] 
+        other_text_filenames_in_curr_dir: List[str] = []
+
+        log.debug(f"DIR_WALK: Considering files in '{current_rel_path_from_target}': {filenames_orig}")
+        for filename in filenames_orig:
+            file_path_abs = current_walk_path / filename
+            file_rel_to_target = file_path_abs.relative_to(target_path)
+
+            log.debug(f"  FILE_CONSIDER: '{filename}' (Full Rel: '{file_rel_to_target}')")
+
+            if filename in ignore_set:
+                log.debug(f"    FILE_IGNORE (Exact Name): '{filename}'. SKIPPING.")
+                continue
+            
+            if filename.startswith('.') and \
+               filename.lower() not in interesting_filenames_set and \
+               filename not in code_extensions_set and \
+               Path(filename).suffix.lower() not in code_extensions_set:
+                log.debug(f"    FILE_IGNORE (Hidden): '{filename}'. SKIPPING.")
                 continue
 
-            if is_likely_binary(file_path):
-                log.debug(f"Skipping binary file: {file_path.relative_to(target_path)}")
+            is_filename_glob_ignored = False
+            for p_glob in ignore_set:
+                if '*' not in p_glob and '?' not in p_glob and '[' not in p_glob: continue
+                if Path(filename).match(p_glob):
+                    log.debug(f"    FILE_IGNORE (Glob on Filename): '{filename}' matched by glob '{p_glob}'. SKIPPING.")
+                    is_filename_glob_ignored = True
+                    break
+            if is_filename_glob_ignored:
+                continue
+            
+            # This check is slightly redundant if directory pruning is perfect, but good for safety.
+            is_parent_path_glob_ignored = False
+            # Check against the relative path from the *target_path* (initial walk root)
+            for p_glob_for_parent_check in ignore_set:
+                if not ('*' in p_glob_for_parent_check or '?' in p_glob_for_parent_check or '[' in p_glob_for_parent_check): continue
+                # Check if any parent component of current_rel_path_from_target matches the glob
+                # This correctly checks if 'discord/file.py' should be skipped if 'discord' is a glob ignore
+                for i_parent in range(len(current_rel_path_from_target.parts)):
+                    path_component_to_check = Path(*current_rel_path_from_target.parts[:i_parent+1])
+                    if path_component_to_check.match(p_glob_for_parent_check):
+                        log.debug(f"    FILE_IGNORE (Parent Path Glob): Parent '{path_component_to_check}' of file '{file_rel_to_target}' "
+                                  f"matched glob '{p_glob_for_parent_check}'. SKIPPING.")
+                        is_parent_path_glob_ignored = True
+                        break
+                if is_parent_path_glob_ignored:
+                    break
+            if is_parent_path_glob_ignored:
+                continue
+
+            if not file_path_abs.is_file(): 
+                log.debug(f"    FILE_SKIP (Not a File): '{filename}'.")
+                continue
+
+            if is_likely_binary(file_path_abs):
+                log.debug(f"    FILE_SKIP (Binary): '{filename}'.")
                 report_data.setdefault(get_file_id_from_path_str(filename), Counter())['skipped_binary_in_folder'] += 1
                 continue
 
             base, ext = os.path.splitext(filename)
             ext_lower = ext.lower()
-            fname_lower = filename.lower()
-
             is_source = (ext_lower in code_extensions_set or 
                          filename in code_extensions_set or
-                         fname_lower in code_extensions_set)
+                         filename.lower() in code_extensions_set)
 
-            relative_file_path_to_root = file_path.relative_to(target_path)
             if is_source:
-                source_files_to_process.append((relative_file_path_to_root, file_path, ext_lower))
+                log.debug(f"    FILE_ADD (Source): '{filename}' (Ext: '{ext_lower}').")
+                source_files_to_process.append((file_rel_to_target, file_path_abs, ext_lower))
             else:
-                other_text_filenames.append(filename)
+                log.debug(f"    FILE_ADD (Other Text): '{filename}'.")
+                other_text_filenames_in_curr_dir.append(filename)
         
         if source_files_to_process:
-            dir_header = f"\n{'=' * 10} Directory: {current_rel_path} {'=' * 10}\n" if str(current_rel_path) != '.' else ""
+            dir_header = f"\n{'=' * 10} Directory: {current_rel_path_from_target} {'=' * 10}\n" if str(current_rel_path_from_target) != '.' else ""
             has_written_dir_header = False
 
             for rel_path, full_path, file_ext in source_files_to_process:
@@ -599,11 +673,11 @@ def process_folder(
                 if file_id_for_report not in report_data: report_data[file_id_for_report] = Counter()
                 report_data[file_id_for_report]['processed'] += 1
                 
-                file_info_prefix = f"--- File: {rel_path}" # Display path relative to target_path
+                file_info_prefix = f"--- File: {rel_path}"
                 is_json_sample = False
 
                 try:
-                    log.debug(f"Processing source file: {rel_path}")
+                    log.debug(f"Opening and simplifying source file: {rel_path}")
                     with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
                     
@@ -655,7 +729,7 @@ def process_folder(
                     write_to_buffer(file_info_prefix_display + " ---")
                     if is_empty_after_simplification:
                         write_to_buffer("# (File is empty or contained only comments/whitespace/logging after simplification)")
-                        if not skip_empty: # If we kept it despite being empty
+                        if not skip_empty: 
                              report_data[file_id_for_report]['kept_empty'] +=1
                     else:
                         write_to_buffer(simplified_content.strip())
@@ -671,13 +745,13 @@ def process_folder(
                     if dir_header and not has_written_dir_header: write_to_buffer(dir_header.strip("\n")); has_written_dir_header = True
                     write_to_buffer(f"{file_info_prefix} --- Error Processing File ---")
 
-        if other_text_filenames:
-            summary = summarize_other_files(other_text_filenames, code_extensions_set, interesting_filenames_set)
+        if other_text_filenames_in_curr_dir:
+            summary = summarize_other_files(other_text_filenames_in_curr_dir, code_extensions_set, interesting_filenames_set)
             if summary:
-                indent_level = len(current_rel_path.parts) if str(current_rel_path) != '.' else 0
+                indent_level = len(current_rel_path_from_target.parts) if str(current_rel_path_from_target) != '.' else 0
                 indent = "  " * indent_level if indent_level > 0 else ""
                 summary_line = f"{indent}{summary}"
-                log.debug(f"Adding summary for {current_rel_path}: {summary_line}")
+                log.debug(f"Adding summary for '{current_rel_path_from_target}': {summary_line}")
 
                 buffer.seek(0, io.SEEK_END)
                 original_end_pos = buffer.tell()
@@ -685,17 +759,15 @@ def process_folder(
                 if original_end_pos > 0:
                     buffer.seek(max(0, original_end_pos - 200))
                     last_part_to_check = buffer.read()
-                    buffer.seek(original_end_pos) # Restore cursor
+                    buffer.seek(original_end_pos) 
 
-                # Add a separating newline if needed before the summary
-                # This checks if the buffer is not empty and doesn't already end with a double newline or the directory header
                 if original_end_pos > 0 and \
                    not last_part_to_check.endswith("\n\n") and \
                    not (dir_header and last_part_to_check.strip().endswith(dir_header.strip())):
                     write_to_buffer("") 
-
                 write_to_buffer(summary_line)
-                write_to_buffer("") # Add a blank line after the summary
+                write_to_buffer("")
+    log.debug(f"--- Finished Standard Folder Walk for {target_path} ---")
 
 
 # --- Raw Dump Functions (largely unchanged, included for completeness) ---
@@ -787,78 +859,125 @@ def process_folder_raw_source(
 ) -> int: 
     """Dumps only recognized 'source' files verbatim, respecting ignore patterns."""
     target_path = Path(target_folder_str).resolve()
-    log.debug(f"Starting RAW SOURCE folder walk: {target_path}")
+    log.debug(f"--- Starting Raw Source Folder Walk ---")
+    log.debug(f"Root: {target_path}")
+    log.debug(f"Effective Ignore Set: {sorted(list(ignore_set))}") # Added
     
     source_file_count = 0
     
     walk_results = sorted(list(os.walk(target_path, topdown=True, onerror=lambda e: log.warning(f"Access error {e.filename}: {e}"))), key=lambda x: x[0])
 
-    for dirpath, dirnames, filenames in walk_results:
-        current_path = Path(dirpath)
-        try:
-            current_rel_path = current_path.relative_to(target_path)
-        except ValueError: # pragma: no cover
-            log.warning(f"Relative path error for {current_path} in raw_source mode. Skipping.")
-            dirnames[:] = [] 
-            continue
-
-        original_dir_count = len(dirnames)
-        dirnames[:] = [d for d in dirnames if d not in ignore_set and not d.startswith('.') and not any(Path(d).match(p) for p in ignore_set if '*' in p or '?' in p)]
-        if len(dirnames) < original_dir_count:
-            log.debug(f"Filtered {original_dir_count - len(dirnames)} subdirectories in {current_rel_path} (Raw Source Mode)")
-
-        log.debug(f"Processing directory (RAW SOURCE): {current_rel_path} (Files: {len(filenames)}, Subdirs: {len(dirnames)})")
+    for dirpath_str, dirnames_orig_iter, filenames_orig_iter in walk_results:
+        current_walk_path = Path(dirpath_str)
+        dirnames_orig = sorted(list(dirnames_orig_iter))
+        filenames_orig = sorted(list(filenames_orig_iter))
         
-        dirnames.sort() 
-        filenames.sort()
+        try:
+            current_rel_path_from_target = current_walk_path.relative_to(target_path)
+        except ValueError: # pragma: no cover
+            log.warning(f"Path Error: Cannot get relative path for '{current_walk_path}' "
+                        f"relative to walk root '{target_path}'. Skipping this path.")
+            dirnames_orig_iter[:] = [] 
+            continue
+        
+        log.debug(f"\nRAW_SOURCE_DIR_WALK: Processing directory '{current_rel_path_from_target}' (Abs: '{current_walk_path}')")
+        log.debug(f"RAW_SOURCE_DIR_WALK: Original subdirectories before filtering: {dirnames_orig}")
 
-        for filename in filenames:
-            if filename in ignore_set or any(Path(filename).match(p) for p in ignore_set if '*' in p or '?' in p):
+        dirs_to_remove_from_walk = []
+        for d_name in dirnames_orig:
+            potential_subdir_rel_to_target = current_rel_path_from_target / d_name
+            if d_name in ignore_set:
+                log.debug(f"  RAW_SOURCE_DIR_IGNORE (Exact Name): '{d_name}' in '{current_rel_path_from_target}'. Marking for removal from walk.")
+                dirs_to_remove_from_walk.append(d_name)
                 continue
-            if filename.startswith('.') and filename.lower() not in interesting_filenames_set and filename not in code_extensions_set:
-                continue 
-
-            file_path = current_path / filename
-            if not file_path.is_file():
+            if d_name.startswith('.') and d_name not in interesting_filenames_set and d_name not in code_extensions_set:
+                log.debug(f"  RAW_SOURCE_DIR_IGNORE (Hidden): '{d_name}' in '{current_rel_path_from_target}'. Marking for removal from walk.")
+                dirs_to_remove_from_walk.append(d_name)
                 continue
+            is_glob_ignored = False
+            for p_glob in ignore_set:
+                if not ('*' in p_glob or '?' in p_glob or '[' in p_glob): continue
+                if potential_subdir_rel_to_target.match(p_glob):
+                    log.debug(f"  RAW_SOURCE_DIR_IGNORE (Glob on RelPath): '{potential_subdir_rel_to_target}' matched by glob '{p_glob}'. Marking for removal from walk.")
+                    is_glob_ignored = True; break
+            if is_glob_ignored:
+                dirs_to_remove_from_walk.append(d_name)
+                continue
+            log.debug(f"  RAW_SOURCE_DIR_KEEP: '{d_name}' in '{current_rel_path_from_target}'. Will be explored by os.walk if not removed by name.")
+        
+        for d_to_remove in dirs_to_remove_from_walk:
+            if d_to_remove in dirnames_orig_iter:
+                 dirnames_orig_iter.remove(d_to_remove)
+        
+        log.debug(f"RAW_SOURCE_DIR_WALK: Subdirectories os.walk will explore next in '{current_rel_path_from_target}': {sorted(list(dirnames_orig_iter))}")
+        
+        log.debug(f"RAW_SOURCE_DIR_WALK: Considering files in '{current_rel_path_from_target}': {filenames_orig}")
+        for filename in filenames_orig:
+            file_path_abs = current_walk_path / filename
+            file_rel_to_target = file_path_abs.relative_to(target_path)
+            log.debug(f"  RAW_SOURCE_FILE_CONSIDER: '{filename}' (Full Rel: '{file_rel_to_target}')")
 
-            if is_likely_binary(file_path):
-                log.debug(f"Skipping binary file in Raw Source mode: {file_path.relative_to(target_path)}")
+            if filename in ignore_set:
+                log.debug(f"    RAW_SOURCE_FILE_IGNORE (Exact Name): '{filename}'. SKIPPING.")
+                continue
+            if filename.startswith('.') and filename.lower() not in interesting_filenames_set and filename not in code_extensions_set and Path(filename).suffix.lower() not in code_extensions_set:
+                log.debug(f"    RAW_SOURCE_FILE_IGNORE (Hidden): '{filename}'. SKIPPING.")
+                continue
+            is_filename_glob_ignored = False
+            for p_glob in ignore_set:
+                if '*' not in p_glob and '?' not in p_glob and '[' not in p_glob: continue
+                if Path(filename).match(p_glob):
+                    log.debug(f"    RAW_SOURCE_FILE_IGNORE (Glob on Filename): '{filename}' matched by glob '{p_glob}'. SKIPPING.")
+                    is_filename_glob_ignored = True; break
+            if is_filename_glob_ignored: continue
+            is_parent_path_glob_ignored = False
+            for p_glob_for_parent_check in ignore_set:
+                if not ('*' in p_glob_for_parent_check or '?' in p_glob_for_parent_check or '[' in p_glob_for_parent_check): continue
+                for i_parent in range(len(current_rel_path_from_target.parts)): # Check current_rel_path_from_target
+                    path_component_to_check = Path(*current_rel_path_from_target.parts[:i_parent+1])
+                    if path_component_to_check.match(p_glob_for_parent_check):
+                        log.debug(f"    RAW_SOURCE_FILE_IGNORE (Parent Path Glob): Parent '{path_component_to_check}' of file in dir '{current_rel_path_from_target}' "
+                                  f"matched glob '{p_glob_for_parent_check}'. SKIPPING file '{filename}'.")
+                        is_parent_path_glob_ignored = True; break
+                if is_parent_path_glob_ignored: break
+            if is_parent_path_glob_ignored: continue
+            if not file_path_abs.is_file():
+                log.debug(f"    RAW_SOURCE_FILE_SKIP (Not a File): '{filename}'.")
+                continue
+            if is_likely_binary(file_path_abs):
+                log.debug(f"    RAW_SOURCE_FILE_SKIP (Binary): '{filename}'.")
                 continue
                 
             base, ext = os.path.splitext(filename)
-            ext_lower = ext.lower()
-            fname_lower = filename.lower()
-
-            is_source = (ext_lower in code_extensions_set or 
-                         filename in code_extensions_set or 
-                         fname_lower in code_extensions_set)
-            
-            relative_file_path = file_path.relative_to(target_path)
+            ext_lower = ext.lower(); fname_lower = filename.lower()
+            is_source = (ext_lower in code_extensions_set or filename in code_extensions_set or fname_lower in code_extensions_set)
             file_id = get_file_id_from_path_str(filename) 
 
             if is_source:
+                log.debug(f"    RAW_SOURCE_FILE_DUMP: '{filename}' is source. Dumping.")
                 if file_id not in report_data: report_data[file_id] = Counter()
                 report_data[file_id]['dumped_raw_source'] += 1
                 source_file_count += 1
                 
-                buffer.write(f"\n{'=' * 20} START SOURCE FILE (RAW): {relative_file_path} {'=' * 20}\n")
-                log.info(f"Dumping source file (RAW) ({source_file_count}): {relative_file_path}")
+                buffer.write(f"\n{'=' * 20} START SOURCE FILE (RAW): {file_rel_to_target} {'=' * 20}\n")
+                log.info(f"Dumping source file (RAW) ({source_file_count}): {file_rel_to_target}")
                 try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    with open(file_path_abs, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
                     if content and not content.endswith('\n'): 
                         content += '\n'
                     buffer.write(content)
                 except OSError as e:
-                    log.error(f"Read error (RAW SOURCE): {relative_file_path}: {e}")
+                    log.error(f"Read error (RAW SOURCE): {file_rel_to_target}: {e}")
                     report_data[file_id]['read_error_raw_source'] += 1
                     buffer.write(f"### ERROR READING FILE (RAW SOURCE): {e} ###\n")
                 except Exception as e: # pragma: no cover
-                    log.error(f"Processing error (RAW SOURCE): {relative_file_path}: {e}", exc_info=True)
+                    log.error(f"Processing error (RAW SOURCE): {file_rel_to_target}: {e}", exc_info=True)
                     report_data[file_id]['processing_error_raw_source'] += 1
                     buffer.write(f"### ERROR PROCESSING FILE (RAW SOURCE): {e} ###\n")
-                buffer.write(f"{'=' * 20} END SOURCE FILE (RAW): {relative_file_path} {'=' * 20}\n")
+                buffer.write(f"{'=' * 20} END SOURCE FILE (RAW): {file_rel_to_target} {'=' * 20}\n")
+            else:
+                 log.debug(f"    RAW_SOURCE_FILE_SKIP (Not Source): '{filename}'.")
 
     log.info(f"Finished raw source dump. Processed and dumped {source_file_count} source files.")
     return source_file_count
@@ -1423,7 +1542,13 @@ def main():
 
     args = parser.parse_args()
 
-    log.setLevel(args.log_level.upper()); logging.getLogger().setLevel(args.log_level.upper())
+    # Set log level for THIS script's logger AND the root logger (to affect other libraries if they use root)
+    # This must be done AFTER parsing args.
+    numeric_level = getattr(logging, args.log_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError(f'Invalid log level: {args.log_level}')
+    log.setLevel(numeric_level)
+    logging.getLogger().setLevel(numeric_level) # Set root logger level
     
     # --- Initialize Globals ---
     seen_content_hashes.clear()
@@ -1479,16 +1604,27 @@ def main():
     print(f"Output Target: {'Stdout' if not args.output else args.output}", file=sys.stderr)
     print(f"Mode: {run_mode_display}", file=sys.stderr)
     print(f"Log Level: {args.log_level.upper()}", file=sys.stderr)
-
-    if args.mode != "raw_dump":
-        print(f"  Include Tests: {effective_test_inclusion} ({'--include-tests flag used' if args.include_tests else ('Default: Exclude tests')})", file=sys.stderr)
-        print(f"  User Ignore Patterns: {args.ignore if args.ignore else 'None'}", file=sys.stderr)
-        print(f"  User Source Extensions: {args.source_ext if args.source_ext else 'None'}", file=sys.stderr)
-        print(f"  User Interesting Files: {args.interesting_files if args.interesting_files else 'None'}", file=sys.stderr)
+    if args.mode != "raw_dump": # Print these for standard and raw_source_dump
+        print(f"  Include Tests: {effective_test_inclusion}", file=sys.stderr)
+        print(f"  Effective Ignore Patterns: {sorted(list(current_ignore_patterns))}", file=sys.stderr) # Log the full set
+        print(f"  Effective Source Extensions: {sorted(list(current_code_extensions))}", file=sys.stderr)
+        print(f"  Effective Interesting Files: {sorted(list(current_interesting_files))}", file=sys.stderr)
     else: 
         print("  (File selection options like --ignore, --include-tests are mostly bypassed in Raw Dump mode)", file=sys.stderr)
-        if resolved_additional_context_path_obj:
-            print(f"  Additional Raw Dump Path: {resolved_additional_context_path_obj}", file=sys.stderr)
+    if resolved_additional_context_path_obj:
+        print(f"  Additional Context Path: {resolved_additional_context_path_obj}", file=sys.stderr)
+
+    # CRITICAL CHECK FOR ROOT FOLDER IGNORING - Moved here after current_ignore_patterns is finalized
+    if is_primary_input_directory and resolved_primary_path.name in current_ignore_patterns:
+        log.critical(
+            f"CRITICAL WARNING: The root processing directory '{resolved_primary_path.name}' "
+            f"is itself in the ignore patterns. This usually means the script will output "
+            "nothing from the primary path because the ignore logic in os.walk "
+            "will prune it immediately. "
+            "If you intend to process this folder, remove '{resolved_primary_path.name}' from "
+            "your ignore patterns or use a more specific glob pattern for subdirectories "
+            " (e.g., '*/discord' instead of just 'discord' if 'discord' is your root)."
+        )
 
     if args.mode == "standard":
         effective_skip_empty = not args.keep_empty
@@ -1497,7 +1633,6 @@ def main():
         print(f"  Skip Duplicate Files (after simplify): {effective_skip_duplicates}", file=sys.stderr)
         print(f"  Strip Logging: {args.strip_logging}", file=sys.stderr)
         
-        # Literal compression status depends on --compress-patterns
         literal_comp_active = not args.compress_patterns 
         if literal_comp_active:
             print(f"  Large Literal Compression: ACTIVE (threshold: {args.large_literal_threshold} lines)", file=sys.stderr)
