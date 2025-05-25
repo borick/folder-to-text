@@ -90,14 +90,14 @@ BINARY_NON_PRINTABLE_THRESHOLD = 0.15 # Percentage of non-printable chars
 # --- Simplification and Compression Patterns ---
 SIMPLIFICATION_PATTERNS = [
     # Obfuscate very long numbers (potential IDs, timestamps if not dates)
-    (re.compile(r'\d{8,}'), '*NUM_LONG*'),
+    #(re.compile(r'\d{8,}'), '*NUM_LONG*'),
     # Obfuscate long hex strings (potential hashes, IDs)
-    (re.compile(r'\b[a-fA-F0-9]{12,}\b'), '*HEX_LONG*'),
+    #(re.compile(r'\b[a-fA-F0-9]{12,}\b'), '*HEX_LONG*'),
     # Obfuscate long Base64-like strings
-    (re.compile(r'[a-zA-Z0-9+/=]{30,}'), '*BASE64LIKE_LONG*'),
+    #(re.compile(r'[a-zA-Z0-9+/=]{30,}'), '*BASE64LIKE_LONG*'),
     # Common float and int patterns (generic)
-    (re.compile(r'\b\d+\.\d+\b'), '*FLOAT*'),
-    (re.compile(r'\b\d+\b'), '*INT*'),
+    #(re.compile(r'\b\d+\.\d+\b'), '*FLOAT*'),
+    #(re.compile(r'\b\d+\b'), '*INT*'),
 ]
 
 POST_SIMPLIFICATION_PATTERNS = [
