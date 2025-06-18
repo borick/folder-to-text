@@ -4,6 +4,7 @@
 # Processes a primary input (folder or file), and optionally an additional context folder.
 # Simplifies text files, summarizes others, compresses patterns/lines. Includes raw dump.
 # Provides a content analysis report of the final output, with Code/Text broken down by extension.
+# Also provides a detailed report on byte savings from compression techniques.
 
 import os
 import re
@@ -290,8 +291,12 @@ def simplify_source_code(
     strip_logging: bool,
     large_literal_threshold: int,
     disable_literal_compression: bool = False
-) -> str:
-    """Simplifies source code content by removing comments, obfuscating, etc."""
+) -> Tuple[str, int]:
+    """
+    Simplifies source code content by removing comments, obfuscating, etc.
+    Returns the simplified content and bytes saved from large literal compression.
+    """
+    bytes_saved_by_literal_compression = 0
     # Multi-line comments (/* ... */, """...""", '''...''')
     content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
     content = re.sub(r'"""(?:.|\n)*?"""', '', content, flags=re.DOTALL) # Python docstrings
@@ -384,6 +389,11 @@ def simplify_source_code(
                          indent = " " * (indent_level)
                          placeholder_line = f"{indent}# ... {literal_line_count} similar lines compressed ..."
                          
+                         # --- SAVINGS CALCULATION ---
+                         original_lines_text = "\n".join(simplified_lines[start_slice_idx:end_slice_idx])
+                         bytes_saved_by_literal_compression += len(original_lines_text.encode('utf-8')) - len(placeholder_line.encode('utf-8'))
+                         # --- END SAVINGS CALCULATION ---
+                         
                          del simplified_lines[start_slice_idx:end_slice_idx]
                          simplified_lines.insert(start_slice_idx, placeholder_line)
                          log.debug(f"Compressed literal block, {literal_line_count} lines replaced with placeholder.")
@@ -416,7 +426,7 @@ def simplify_source_code(
     # Remove excessive blank lines (max 1 blank line)
     processed_content = re.sub(r'\n{3,}', '\n\n', processed_content)
     
-    return processed_content
+    return processed_content, bytes_saved_by_literal_compression
 
 def process_single_file_standard(
     target_file_path_str: str,
@@ -425,6 +435,8 @@ def process_single_file_standard(
     large_literal_threshold: int,
     disable_literal_compression: bool, # True if pattern compression is on
     report_data: Dict[str, Counter],
+    savings_report: Dict[str, int], # For tracking byte savings
+    total_original_bytes: List[int], # Use a list to be mutable across calls
     is_additional_context: bool = False # Added parameter
 ):
     """Processes a single file in standard mode."""
@@ -464,9 +476,16 @@ def process_single_file_standard(
         with open(target_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
 
+        original_bytes = len(content.encode('utf-8'))
+        total_original_bytes[0] += original_bytes
+
         hash_before = hashlib.sha256(content.encode('utf-8')).hexdigest()
         is_json_sample = False
         file_ext = target_file_path.suffix.lower()
+
+        simplified_content = ""
+        file_info_prefix_display = file_info_prefix
+        literal_comp_savings = 0
 
         if file_ext == '.json':
             log.debug(f"Attempting to generate sample for JSON file: {target_file_path}")
@@ -477,24 +496,26 @@ def process_single_file_standard(
                 is_json_sample = True
                 log.info(f"Generated sample for {target_file_path} (status: {status})")
                 report_data[file_id_for_report]['json_sampled'] += 1
+                savings_report['JSON Sampling'] += original_bytes - len(simplified_content.encode('utf-8'))
             else:
                 log.warning(f"Could not generate sample for {target_file_path} (status: {status}). Falling back to standard simplification.")
-                simplified_content = simplify_source_code(content, strip_logging, large_literal_threshold, disable_literal_compression)
-                file_info_prefix_display = file_info_prefix
+                simplified_content, literal_comp_savings = simplify_source_code(content, strip_logging, large_literal_threshold, disable_literal_compression)
         else:
-            simplified_content = simplify_source_code(content, strip_logging, large_literal_threshold, disable_literal_compression)
-            file_info_prefix_display = file_info_prefix
+            simplified_content, literal_comp_savings = simplify_source_code(content, strip_logging, large_literal_threshold, disable_literal_compression)
         
+        # Calculate savings if not already handled by JSON sampling
+        if not is_json_sample:
+            final_bytes = len(simplified_content.encode('utf-8'))
+            total_simplification_savings = original_bytes - final_bytes
+            savings_report['Large Literal Compression'] += literal_comp_savings
+            savings_report['General Simplification (comments, logging, etc.)'] += total_simplification_savings - literal_comp_savings
+
         hash_after = hashlib.sha256(simplified_content.encode('utf-8')).hexdigest()
         is_simplified = hash_before != hash_after
         is_empty_after_simplification = not simplified_content.strip()
 
         if is_simplified and not is_empty_after_simplification and not is_json_sample:
             report_data[file_id_for_report]['simplified'] += 1
-
-        # Single file processing doesn't typically use skip_empty or skip_duplicates logic
-        # It's usually about processing THIS specific file. If that behavior is desired,
-        # it would need to be passed in or handled differently.
 
         write_to_buffer(file_info_prefix_display + " ---")
         if is_empty_after_simplification:
@@ -525,7 +546,9 @@ def process_folder(
     skip_duplicates: bool,
     large_literal_threshold: int,
     disable_literal_compression: bool,
-    report_data: Dict[str, Counter]
+    report_data: Dict[str, Counter],
+    savings_report: Dict[str, int], # For tracking byte savings
+    total_original_bytes: List[int] # Use a list to be mutable across calls
 ):
     def write_to_buffer(text): buffer.write(text + "\n")
 
@@ -675,12 +698,17 @@ def process_folder(
                 
                 file_info_prefix = f"--- File: {rel_path}"
                 is_json_sample = False
+                simplified_content = ""
+                file_info_prefix_display = file_info_prefix
+                literal_comp_savings = 0
 
                 try:
                     log.debug(f"Opening and simplifying source file: {rel_path}")
                     with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
                     
+                    original_bytes = len(content.encode('utf-8'))
+                    total_original_bytes[0] += original_bytes
                     hash_before = hashlib.sha256(content.encode('utf-8')).hexdigest()
                     
                     if file_ext == '.json':
@@ -692,16 +720,21 @@ def process_folder(
                             is_json_sample = True
                             log.info(f"Generated sample for {rel_path} (status: {status})")
                             report_data[file_id_for_report]['json_sampled'] += 1
+                            savings_report['JSON Sampling'] += original_bytes - len(simplified_content.encode('utf-8'))
                         else:
                             log.warning(f"Could not generate sample for {rel_path} (status: {status}). Falling back to standard simplification.")
-                            simplified_content = simplify_source_code(content, strip_logging, large_literal_threshold, disable_literal_compression)
-                            file_info_prefix_display = file_info_prefix
+                            simplified_content, literal_comp_savings = simplify_source_code(content, strip_logging, large_literal_threshold, disable_literal_compression)
                     else:
-                        simplified_content = simplify_source_code(content, strip_logging, large_literal_threshold, disable_literal_compression)
-                        file_info_prefix_display = file_info_prefix
+                        simplified_content, literal_comp_savings = simplify_source_code(content, strip_logging, large_literal_threshold, disable_literal_compression)
+                    
+                    # Calculate savings if not already handled by JSON sampling
+                    if not is_json_sample:
+                        final_bytes = len(simplified_content.encode('utf-8'))
+                        total_simplification_savings = original_bytes - final_bytes
+                        savings_report['Large Literal Compression'] += literal_comp_savings
+                        savings_report['General Simplification (comments, logging, etc.)'] += total_simplification_savings - literal_comp_savings
 
                     hash_after = hashlib.sha256(simplified_content.encode('utf-8')).hexdigest()
-                    
                     is_simplified = hash_before != hash_after
                     is_empty_after_simplification = not simplified_content.strip()
                     
@@ -1066,11 +1099,15 @@ def expand_multi_pattern_lines(content: str, finder_pattern: re.Pattern, pattern
     return "".join(output_lines), lines_expanded
 
 
-def compress_pattern_blocks(content: str, patterns_to_compress: dict[str, re.Pattern], min_consecutive: int) -> tuple[str, int]:
-    """Compresses blocks of consecutive lines matching predefined patterns."""
+def compress_pattern_blocks(content: str, patterns_to_compress: dict[str, re.Pattern], min_consecutive: int) -> tuple[str, int, int]:
+    """
+    Compresses blocks of consecutive lines matching predefined patterns.
+    Returns the new content, number of blocks compressed, and bytes saved.
+    """
     lines = content.splitlines(keepends=True)
     output_lines = []
     total_blocks_compressed = 0
+    total_bytes_saved = 0
     i = 0
     log.debug(f"--- Starting compress_pattern_blocks: Scanning for blocks (min_consecutive={min_consecutive}) ---")
 
@@ -1127,6 +1164,13 @@ def compress_pattern_blocks(content: str, patterns_to_compress: dict[str, re.Pat
                     indent = first_line_in_block[:len(first_line_in_block) - len(first_line_stripped)]
                 
                 summary_line = f"{indent}# ... {block_count} lines matching '{block_pattern_name}' pattern compressed ...\n"
+                
+                # --- SAVINGS CALCULATION ---
+                original_block_text = "".join(lines[block_start_index:j])
+                saved_bytes_for_block = len(original_block_text.encode('utf-8')) - len(summary_line.encode('utf-8'))
+                total_bytes_saved += saved_bytes_for_block
+                # --- END SAVINGS CALCULATION ---
+                
                 output_lines.append(summary_line)
                 log.info(f"Compressed {block_count} lines (Indices {block_start_index+1}-{j}) matching '{block_pattern_name}'.")
                 total_blocks_compressed += 1
@@ -1141,11 +1185,14 @@ def compress_pattern_blocks(content: str, patterns_to_compress: dict[str, re.Pat
             i += 1
             
     log.info(f"Pattern block compression: Compressed {total_blocks_compressed} blocks (min consecutive: {min_consecutive}).")
-    return "".join(output_lines), total_blocks_compressed
+    return "".join(output_lines), total_blocks_compressed, total_bytes_saved
 
 
-def minify_repeated_lines(content: str, min_length: int, min_repetitions: int) -> tuple[str, int, Dict[str, Counter]]:
-    """Identifies and replaces frequently repeated long lines with placeholders."""
+def minify_repeated_lines(content: str, min_length: int, min_repetitions: int) -> tuple[str, int, Dict[str, Counter], int]:
+    """
+    Identifies and replaces frequently repeated long lines with placeholders.
+    Returns new content, replacements made, origin report, and net bytes saved.
+    """
     global DEFINITION_SIMPLIFICATION_PATTERNS
     
     lines = content.splitlines(keepends=True)
@@ -1182,7 +1229,7 @@ def minify_repeated_lines(content: str, min_length: int, min_repetitions: int) -
     
     if not repeated_lines_candidates:
         log.info("Line minification: No lines met the repetition and length criteria.")
-        return content, 0, {}
+        return content, 0, {}, 0
 
     # Create context finder AFTER initial lines are established, BEFORE modification
     find_file_context = create_file_context_finder(lines) 
@@ -1213,6 +1260,8 @@ def minify_repeated_lines(content: str, min_length: int, min_repetitions: int) -
     
     new_lines = list(lines) # Make a mutable copy
     num_actual_replacements_done = 0
+    total_bytes_saved_from_replacements = 0
+    
     if replacement_map:
         for i, line_val in enumerate(lines): # Iterate original lines to find what to replace
             stripped_content_for_match = line_val.strip().rstrip() # Match key format
@@ -1224,10 +1273,18 @@ def minify_repeated_lines(content: str, min_length: int, min_repetitions: int) -
                 # Construct the replacement line, ensuring it maintains the original line's indent
                 original_indent_len = len(line_val) - len(line_val.lstrip())
                 indent_str = line_val[:original_indent_len]
-                new_lines[i] = indent_str + placeholder + trailing_newline
+                new_line_content = indent_str + placeholder + trailing_newline
+                
+                # --- SAVINGS CALCULATION ---
+                total_bytes_saved_from_replacements += len(line_val.encode('utf-8')) - len(new_line_content.encode('utf-8'))
+                # --- END SAVINGS CALCULATION ---
+                
+                new_lines[i] = new_line_content
                 num_actual_replacements_done += 1
     
     minified_content = "".join(new_lines)
+    definition_block_str = ""
+    net_bytes_saved = 0
     
     if definition_lines:
         definition_header = [
@@ -1236,17 +1293,27 @@ def minify_repeated_lines(content: str, min_length: int, min_repetitions: int) -
             "=" * 40
         ]
         definition_block_str = "\n".join(definition_header + definition_lines) + "\n\n"
+        
+        # --- NET SAVINGS CALCULATION ---
+        definition_block_cost = len(definition_block_str.encode('utf-8'))
+        net_bytes_saved = total_bytes_saved_from_replacements - definition_block_cost
+        # --- END NET SAVINGS CALCULATION ---
+        
         log.info(f"Line minification: Replaced {num_actual_replacements_done} occurrences of {len(definition_lines)} unique lines.")
-        return definition_block_str + minified_content, num_actual_replacements_done, minified_line_origins
+        return definition_block_str + minified_content, num_actual_replacements_done, minified_line_origins, net_bytes_saved
     else:
-        return content, 0, {}
+        return content, 0, {}, 0
 
 
-def post_process_cleanup(content: str, cleanup_pattern: re.Pattern) -> tuple[str, int, Dict[str, Counter]]:
-    """Removes lines that consist *only* of placeholders, commas, brackets, etc., after all other processing."""
+def post_process_cleanup(content: str, cleanup_pattern: re.Pattern) -> tuple[str, int, Dict[str, Counter], int]:
+    """
+    Removes lines that consist *only* of placeholders, commas, brackets, etc., after all other processing.
+    Returns new content, lines removed, origin report, and bytes saved.
+    """
     lines = content.splitlines(keepends=True)
     output_lines = []
     lines_removed = 0
+    bytes_saved = 0
     cleanup_origins_report: Dict[str, Counter] = defaultdict(Counter)
 
     find_file_context_for_cleanup = create_file_context_finder(lines)
@@ -1271,6 +1338,7 @@ def post_process_cleanup(content: str, cleanup_pattern: re.Pattern) -> tuple[str
         if cleanup_pattern.match(stripped_line): 
             log.debug(f"Post-cleanup removing line {i+1}: {stripped_line[:80]}...")
             lines_removed += 1
+            bytes_saved += len(line.encode('utf-8')) # The saving is the entire line's byte length
             file_id = find_file_context_for_cleanup(i)
             cleanup_origins_report[file_id]['removed_by_cleanup'] += 1
         else:
@@ -1278,7 +1346,7 @@ def post_process_cleanup(content: str, cleanup_pattern: re.Pattern) -> tuple[str
 
     cleaned_content = "".join(output_lines)
     log.info(f"Post-processing cleanup: Removed {lines_removed} lines.")
-    return cleaned_content, lines_removed, dict(cleanup_origins_report) # Convert back to dict for consistency
+    return cleaned_content, lines_removed, dict(cleanup_origins_report), bytes_saved
 
 # Placeholder for generate_output_file_summary
 def generate_output_file_summary(report_data: Dict[str, Counter], mode_display: str) -> str:
@@ -1557,6 +1625,11 @@ def main():
     minification_origin_report: Dict[str, Counter] = {} 
     cleanup_origin_report: Dict[str, Counter] = {} 
     
+    # --- NEW: Initialize Savings Tracking ---
+    savings_report: Dict[str, int] = defaultdict(int)
+    # Use a list for mutability so it can be passed into functions and modified
+    total_original_bytes_tracker = [0] 
+    
     primary_input_path_obj = Path(args.folder_path) # Corrected from args.input_path
     if not primary_input_path_obj.exists():
         log.critical(f"Error: Primary input path not found: '{args.folder_path}'"); sys.exit(1)
@@ -1726,14 +1799,14 @@ def main():
                     current_ignore_patterns, current_code_extensions, current_interesting_files,
                     effective_skip_empty, args.strip_logging, effective_skip_duplicates,
                     args.large_literal_threshold, disable_large_literal_comp_if_pattern_comp_active,
-                    process_report_data
+                    process_report_data, savings_report, total_original_bytes_tracker
                 )
             else: # Primary input is a single file
                 process_single_file_standard(
                     resolved_path_str, content_buffer,
                     args.strip_logging, args.large_literal_threshold,
                     disable_large_literal_comp_if_pattern_comp_active,
-                    process_report_data
+                    process_report_data, savings_report, total_original_bytes_tracker
                 )
                 files_processed_count = 1 # Processed one file
 
@@ -1748,7 +1821,8 @@ def main():
 
             if args.compress_patterns and current_processed_content.strip():
                 log.info("Step 3: Compressing pattern blocks...")
-                current_processed_content, num_blocks_compressed = compress_pattern_blocks(current_processed_content, BLOCK_COMPRESSION_PATTERNS, args.min_consecutive)
+                current_processed_content, num_blocks_compressed, bytes_saved = compress_pattern_blocks(current_processed_content, BLOCK_COMPRESSION_PATTERNS, args.min_consecutive)
+                savings_report['Pattern Block Compression'] += bytes_saved
                 log.info(f"Finished Step 3 (Pattern Block Compression). Compressed {num_blocks_compressed} blocks.")
 
             if args.apply_patterns and current_processed_content.strip():
@@ -1758,12 +1832,14 @@ def main():
 
             if args.minify_lines and current_processed_content.strip():
                 log.info("Step 5: Minifying identical long lines...")
-                current_processed_content, num_lines_minified, minification_origin_report = minify_repeated_lines(current_processed_content, args.min_line_length, args.min_repetitions)
+                current_processed_content, num_lines_minified, minification_origin_report, net_bytes_saved = minify_repeated_lines(current_processed_content, args.min_line_length, args.min_repetitions)
+                savings_report['Line Minification'] += net_bytes_saved
                 log.info(f"Finished Step 5 (Line Minification). Minified {num_lines_minified} line instances into {len(definition_lines) if 'definition_lines' in locals() else 0} definitions.") # definition_lines is local to minify_repeated_lines
             
             if args.post_cleanup and current_processed_content.strip():
                 log.info("Step 6: Applying post-processing cleanup...")
-                current_processed_content, num_lines_cleaned_up, cleanup_origin_report = post_process_cleanup(current_processed_content, PLACEHOLDER_CLEANUP_PATTERN)
+                current_processed_content, num_lines_cleaned_up, cleanup_origin_report, bytes_saved = post_process_cleanup(current_processed_content, PLACEHOLDER_CLEANUP_PATTERN)
+                savings_report['Post-processing Cleanup'] += bytes_saved
                 log.info(f"Finished Step 6 (Post-Cleanup). Removed {num_lines_cleaned_up} lines.")
             
             main_content_str = current_processed_content
@@ -1802,6 +1878,33 @@ def main():
             if args.minify_lines: print(f"  Identical Line Minification: Created {len(minification_origin_report)} definition(s) replacing {num_lines_minified} original line instances.", file=sys.stderr)
             if args.post_cleanup: print(f"  Post-processing Cleanup: Removed {num_lines_cleaned_up} lines.", file=sys.stderr)
             
+            # --- NEW: Savings Analysis Report ---
+            print("\n--- Savings Analysis (Standard Mode) ---", file=sys.stderr)
+            total_original_bytes = total_original_bytes_tracker[0]
+            final_content_bytes = len(main_content_str.encode('utf-8'))
+            total_reduction = total_original_bytes - final_content_bytes
+            reduction_percent = (total_reduction / total_original_bytes * 100) if total_original_bytes > 0 else 0
+            
+            print(f"  Initial size of processed text files: {total_original_bytes:>12,} bytes", file=sys.stderr)
+            print(f"  Final content size:                   {final_content_bytes:>12,} bytes", file=sys.stderr)
+            print(f"  Total reduction:                      {total_reduction:>12,} bytes ({reduction_percent:.2f}% reduction)", file=sys.stderr)
+
+            if total_reduction > 0:
+                print("\n  Savings Breakdown:", file=sys.stderr)
+                # Sort savings by amount, descending
+                sorted_savings = sorted(savings_report.items(), key=lambda item: item[1], reverse=True)
+                total_accounted_savings = 0
+                for source, saved_bytes in sorted_savings:
+                    if saved_bytes != 0: # Print both positive and negative savings
+                        print(f"    - {source:<40}: {saved_bytes:>+12,} bytes", file=sys.stderr)
+                        total_accounted_savings += saved_bytes
+                
+                print("    " + "-" * 54, file=sys.stderr)
+                print(f"    - {'Total Accounted Savings':<40}: {total_accounted_savings:>+12,} bytes", file=sys.stderr)
+                if total_accounted_savings != total_reduction:
+                    log.warning(f"Mismatch between total reduction ({total_reduction}) and accounted savings ({total_accounted_savings}). This may be due to rounding or unaccounted transformations.")
+            # --- END Savings Analysis Report ---
+
             if args.minify_lines and minification_origin_report:
                 print("\n--- Minification Origin Report (Placeholder Instances Created per File Type) ---", file=sys.stderr)
                 total_minified_instances_reported = 0
@@ -1831,14 +1934,8 @@ def main():
                 if total_cleaned_up_reported != num_lines_cleaned_up:
                      log.warning(f"Mismatch: Reported cleaned lines ({total_cleaned_up_reported}) vs total removed ({num_lines_cleaned_up}).")
             
-            # File Type Processing Report (from process_report_data) is already part of generate_output_file_summary
-            # So it will be in the output file. If you want it on stderr too, you can print it here.
-
         elif args.mode == "raw_source_dump":
             print(f"  Dumped content of {files_processed_count} source files.", file=sys.stderr)
-            if process_report_data: # process_report_data now comes from generate_output_file_summary format
-                # This will be a more detailed summary now
-                pass # Summary is in the output file
         else: # Raw Dump (all files)
             print(f"  Dumped content of {files_processed_count} files.", file=sys.stderr)
         
