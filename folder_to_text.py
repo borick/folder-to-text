@@ -9,11 +9,11 @@ import sys
 from collections import defaultdict
 
 # --- Configuration ---
-# Version 2: Added more aggressive SQL cleaning and better defaults.
+# Version 3: Added logic to select only the latest .sql file from 'backup' directories.
 CONFIG = {
     "EXCLUDE_DIRS_DEFAULT": {
         '.git', 'venv', '__pycache__', 'node_modules', '.pytest_cache', 'build', 'dist',
-        'htmlcov', '.mypy_cache', 'reports', 'backup', 'data',
+        'htmlcov', '.mypy_cache', 'reports', 'data',  # 'backup' is removed to allow discovery
     },
     "EXCLUDE_FILES_DEFAULT": {
         '.DS_Store', '.gitignore', 'package-lock.json', 'yarn.lock',
@@ -43,43 +43,43 @@ CONFIG = {
                 lambda m: f"{m.group(1)}-- [SQL DATA OMITTED FOR BREVITY]\n{m.group(3)}",
                 "SQL_COPY_DATA"
             ),
-            # NEW Pattern 2: Remove all SQL comments
+            # Pattern 2: Remove all SQL comments
             (
                 re.compile(r'^--.*?\n', re.MULTILINE),
                 "",
                 "SQL_COMMENTS"
             ),
-            # NEW Pattern 3: Remove all boilerplate SET statements
+            # Pattern 3: Remove all boilerplate SET statements
             (
                 re.compile(r'^SET .*?;\n', re.MULTILINE),
                 "",
                 "SQL_SET_STATEMENTS"
             ),
-            # NEW Pattern 4: Remove sequence ownership and value setting
+            # Pattern 4: Remove sequence ownership and value setting
             (
                 re.compile(r'^SELECT pg_catalog\.setval.*?;', re.MULTILINE | re.IGNORECASE),
                 "",
                 "SQL_SETVAL"
             ),
-             # NEW Pattern 5: Remove noisy ALTER TABLE ... ADD CONSTRAINT statements
+             # Pattern 5: Remove noisy ALTER TABLE ... ADD CONSTRAINT statements
             (
                 re.compile(r'^ALTER TABLE .*? ADD CONSTRAINT .*?;\n', re.MULTILINE),
                 "",
                 "SQL_ADD_CONSTRAINT"
             ),
-            # NEW Pattern 6: Remove noisy CREATE INDEX statements
+            # Pattern 6: Remove noisy CREATE INDEX statements
             (
                 re.compile(r'^CREATE (UNIQUE )?INDEX .*?;\n', re.MULTILINE),
                 "",
                 "SQL_CREATE_INDEX"
             ),
-            # NEW Pattern 7: Remove noisy ALTER TABLE ... OWNER TO ... statements
+            # Pattern 7: Remove noisy ALTER TABLE ... OWNER TO ... statements
             (
                  re.compile(r'^ALTER (TABLE|TYPE|SEQUENCE) .*? OWNER TO .*?;\n', re.MULTILINE),
                  "",
                  "SQL_OWNER_TO"
             ),
-             # NEW Pattern 8: Remove sequence anmespace setting
+             # Pattern 8: Remove sequence anmespace setting
             (
                  re.compile(r'^ALTER SEQUENCE .*? OWNED BY .*?;\n', re.MULTILINE),
                  "",
@@ -147,51 +147,32 @@ def analyze_output(output_content: str):
         print(f"  - {ext:<12s}: {chars:>10,d} chars ({percentage:5.2f}%) [{count} file(s)]", file=sys.stderr)
     print("-"*40, file=sys.stderr)
 
-def process_path(path: Path, config: dict, args: argparse.Namespace, processed_files: set, output_abs_path: Path):
-    """Recursively processes a directory or a single file and returns content parts."""
-    content_parts = []
+def discover_files(path: Path, config: dict, args: argparse.Namespace, output_abs_path: Path) -> list[Path]:
+    """
+    Recursively discovers all files in a path that match the include/exclude criteria.
+    Returns a list of Path objects.
+    """
+    discovered_paths = []
     
     if path.is_file():
-        try:
-            relative_file_path_str = path.relative_to(args.root_path).as_posix()
-        except ValueError:
-            relative_file_path_str = str(path)
-
-        if relative_file_path_str in processed_files:
-            return []
-        processed_files.add(relative_file_path_str)
-        log_info(f"Processing single file: {relative_file_path_str}")
-
-        try:
-            content = path.read_text(encoding='utf-8', errors='ignore')
-            if content.strip():
-                processed_content = process_file_content(path, content, args, config)
-                content_parts.append(f"--- File: {relative_file_path_str} ---\n")
-                content_parts.append(processed_content)
-                content_parts.append(f"\n--- End File: {relative_file_path_str} ---\n")
-        except Exception as e:
-            log_error(f"Could not process file {path}: {e}")
-        return content_parts
+        # Handle the case where the root_path is a single file
+        if path.resolve() != output_abs_path and path.suffix.lower() in config["INCLUDE_EXT_DEFAULT"]:
+            discovered_paths.append(path)
+        return discovered_paths
 
     for root, dirs, files in os.walk(path, topdown=True):
         current_dir = Path(root)
+        
+        # Directory exclusion logic
         dirs[:] = [d for d in dirs if d not in config["EXCLUDE_DIRS_DEFAULT"] and d not in args.ignore_dir]
         if not args.include_tests and 'tests' in dirs:
             dirs.remove('tests')
         
-        try:
-            relative_dir = current_dir.relative_to(path)
-        except ValueError:
-            relative_dir = current_dir
-
-        if str(relative_dir) != '.':
-            content_parts.append(f"========== Directory: {relative_dir.as_posix()} ==========\n")
-
-        files_to_process = []
         for f in files:
             file_path = current_dir / f
             ext = file_path.suffix.lower()
             
+            # File exclusion logic
             if file_path.resolve() == output_abs_path: continue
             if args.ignore_all_txt and ext == '.txt' and file_path.name.lower() != 'requirements.txt': continue
             if file_path.name in config["EXCLUDE_FILES_DEFAULT"] or file_path.name in args.ignore_file: continue
@@ -199,30 +180,9 @@ def process_path(path: Path, config: dict, args: argparse.Namespace, processed_f
             if args.ignore_extension and ext in args.ignore_extension: continue
             if ext not in config["INCLUDE_EXT_DEFAULT"]: continue
             
-            files_to_process.append(f)
-        
-        for filename in sorted(files_to_process):
-            file_path = current_dir / filename
-            try:
-                relative_file_path_str = file_path.relative_to(args.root_path).as_posix()
-            except ValueError:
-                 relative_file_path_str = str(file_path)
-
-            if relative_file_path_str in processed_files: continue
-            processed_files.add(relative_file_path_str)
-
-            try:
-                log_info(f"Processing file: {relative_file_path_str}")
-                content = file_path.read_text(encoding='utf-8', errors='ignore')
-                if content.strip():
-                    processed_content = process_file_content(file_path, content, args, config)
-                    content_parts.append(f"--- File: {relative_file_path_str} ---\n")
-                    content_parts.append(processed_content)
-                    content_parts.append(f"\n--- End File: {relative_file_path_str} ---\n")
-            except Exception as e:
-                log_error(f"Could not process file {file_path}: {e}")
-    
-    return content_parts
+            discovered_paths.append(file_path)
+            
+    return discovered_paths
 
 def main():
     parser = argparse.ArgumentParser(
@@ -241,7 +201,6 @@ def main():
     parser.add_argument("--ignore-file", action="append", default=[], help="Specify file names to ignore.")
     parser.add_argument("--ignore-extension", action="append", default=[], help="Specify file extensions to ignore (e.g., .log).")
     
-    # NEW FLAG for ignoring .txt files
     parser.add_argument("--ignore-all-txt", action="store_true", help="Ignore all .txt files except for 'requirements.txt'.")
     
     parser.add_argument("--no-minify-lines", action="store_true", help="Do not remove blank lines or strip whitespace from lines.")
@@ -255,26 +214,60 @@ def main():
     output_abs_path = args.output.resolve()
     output_abs_path.parent.mkdir(parents=True, exist_ok=True)
     
-    processed_files = set()
-    output_content_parts = []
+    # --- 1. Discover all potential files ---
+    all_discovered_files = set()
     
-    output_content_parts.append(f"--- START OF FILE {args.output.name} ---\n\n")
-    
-    primary_description = "folder" if args.root_path.is_dir() else "file"
-    log_info(f"--- Processing Primary {primary_description.upper()}: {args.root_path} ---")
-    output_content_parts.append(f"# Compressed Representation of Primary {primary_description}: {args.root_path}\n\n")
-    output_content_parts.extend(
-        process_path(args.root_path, CONFIG, args, processed_files, output_abs_path)
-    )
+    log_info(f"--- Discovering files in Primary Path: {args.root_path} ---")
+    all_discovered_files.update(discover_files(args.root_path, CONFIG, args, output_abs_path))
 
     if args.additional_context_folder and args.additional_context_folder.is_dir():
-        log_info(f"--- Processing Additional Context Folder: {args.additional_context_folder} ---")
-        output_content_parts.append(f"\n# Additional Context from folder: {args.additional_context_folder}\n\n")
-        output_content_parts.extend(
-            process_path(args.additional_context_folder, CONFIG, args, processed_files, output_abs_path)
-        )
+        log_info(f"--- Discovering files in Additional Context Folder: {args.additional_context_folder} ---")
+        all_discovered_files.update(discover_files(args.additional_context_folder, CONFIG, args, output_abs_path))
     elif args.additional_context_folder:
         log_warn(f"Additional context folder specified but not found: {args.additional_context_folder}")
+
+    # --- 2. Apply special filtering for backup files ---
+    backup_sql_files = []
+    other_files = []
+    for file_path in all_discovered_files:
+        if file_path.parent.name == 'backup' and file_path.suffix.lower() == '.sql':
+            backup_sql_files.append(file_path)
+        else:
+            other_files.append(file_path)
+
+    final_files_to_process = other_files
+    if backup_sql_files:
+        # Find the latest .sql file in the backup directory by modification time
+        latest_backup_file = max(backup_sql_files, key=os.path.getmtime)
+        log_info(f"Found {len(backup_sql_files)} SQL backup files. Selecting the latest: {latest_backup_file.name}")
+        final_files_to_process.append(latest_backup_file)
+        
+    # Sort the final list for consistent output
+    final_files_to_process.sort()
+
+    # --- 3. Process the final, filtered list of files ---
+    output_content_parts = [f"--- START OF FILE {args.output.name} ---\n\n"]
+    
+    primary_description = "folder" if args.root_path.is_dir() else "file"
+    output_content_parts.append(f"# Compressed Representation of Primary {primary_description}: {args.root_path}\n\n")
+
+    for file_path in final_files_to_process:
+        try:
+            # Safely create a relative path string
+            try:
+                relative_file_path_str = file_path.relative_to(args.root_path).as_posix()
+            except ValueError:
+                relative_file_path_str = str(file_path)
+                
+            log_info(f"Processing file: {relative_file_path_str}")
+            content = file_path.read_text(encoding='utf-8', errors='ignore')
+            if content.strip():
+                processed_content = process_file_content(file_path, content, args, CONFIG)
+                output_content_parts.append(f"--- File: {relative_file_path_str} ---\n")
+                output_content_parts.append(processed_content)
+                output_content_parts.append(f"\n--- End File: {relative_file_path_str} ---\n")
+        except Exception as e:
+            log_error(f"Could not process file {file_path}: {e}")
 
     output_content_parts.append("\n--- END OF FILE ---")
     final_output_content = "".join(output_content_parts)
