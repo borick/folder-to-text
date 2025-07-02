@@ -9,6 +9,7 @@ import sys
 from collections import defaultdict
 
 # --- Configuration ---
+# Version 4: Added robust, pattern-based test file filtering for frontend projects.
 # Version 3: Added logic to select only the latest .sql file from 'backup' directories.
 CONFIG = {
     "EXCLUDE_DIRS_DEFAULT": {
@@ -27,7 +28,7 @@ CONFIG = {
         re.compile(r'\.swp$'),
     ],
     "INCLUDE_EXT_DEFAULT": {
-        '.py', '.js', '.jsx', '.css', '.scss', '.md', '.json', '.sql',
+        '.py', '.js', '.jsx', '.ts', '.tsx', '.css', '.scss', '.md', '.json', '.sql',
         '.ini', '.cfg', '.toml', '.yaml', '.yml', '.sh', '.bat', '.txt',
         '.mako', 'Dockerfile'
     },
@@ -35,6 +36,8 @@ CONFIG = {
         "max_lines": 50,
         "max_chars": 3000
     },
+    # New in v4: A pattern to identify common test file naming conventions.
+    "TEST_FILE_PATTERN": re.compile(r'([._])(test|spec)\.(js|jsx|ts|tsx)$', re.IGNORECASE),
     "COMPLEX_PATTERNS": {
         '.sql': [
             # Pattern 1: Collapse all COPY data blocks (the biggest token saver)
@@ -160,19 +163,27 @@ def discover_files(path: Path, config: dict, args: argparse.Namespace, output_ab
             discovered_paths.append(path)
         return discovered_paths
 
+    test_file_pattern = config.get("TEST_FILE_PATTERN")
+
     for root, dirs, files in os.walk(path, topdown=True):
         current_dir = Path(root)
         
-        # Directory exclusion logic
+        # --- Directory exclusion logic ---
         dirs[:] = [d for d in dirs if d not in config["EXCLUDE_DIRS_DEFAULT"] and d not in args.ignore_dir]
+        # 1. Old method: Exclude any directory named 'tests'
         if not args.include_tests and 'tests' in dirs:
             dirs.remove('tests')
         
         for f in files:
+            # --- File exclusion logic ---
+            
+            # 2. New method: Exclude files matching test pattern (e.g., *.test.js)
+            if not args.include_tests and test_file_pattern and test_file_pattern.search(f):
+                continue
+            
             file_path = current_dir / f
             ext = file_path.suffix.lower()
             
-            # File exclusion logic
             if file_path.resolve() == output_abs_path: continue
             if args.ignore_all_txt and ext == '.txt' and file_path.name.lower() != 'requirements.txt': continue
             if file_path.name in config["EXCLUDE_FILES_DEFAULT"] or file_path.name in args.ignore_file: continue
@@ -196,7 +207,7 @@ def main():
         help="Optional: A path to an additional folder to include in the context."
     )
     
-    parser.add_argument("--include-tests", action="store_true", help="Include the 'tests' directory in the output.")
+    parser.add_argument("--include-tests", action="store_true", help="Include test files and 'tests' directories in the output.")
     parser.add_argument("--ignore-dir", action="append", default=[], help="Specify directory names to ignore.")
     parser.add_argument("--ignore-file", action="append", default=[], help="Specify file names to ignore.")
     parser.add_argument("--ignore-extension", action="append", default=[], help="Specify file extensions to ignore (e.g., .log).")
