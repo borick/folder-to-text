@@ -9,87 +9,61 @@ import sys
 from collections import defaultdict
 
 # --- Configuration ---
-# Version 4: Added robust, pattern-based test file filtering for frontend projects.
-# Version 3: Added logic to select only the latest .sql file from 'backup' directories.
+# Version 5.2: Excluded .sql files by default for better compression.
+
+def _summarize_package_json(content: str) -> str:
+    """Summarizes package.json to its most essential parts for LLM context."""
+    try:
+        data = json.loads(content)
+        summary = {
+            "name": data.get("name"),
+            "version": data.get("version"),
+            "scripts": data.get("scripts"),
+        }
+        return (
+            f"// Summarized package.json. Key details:\n"
+            f"{json.dumps(summary, indent=2)}\n"
+            f"// Dependencies are omitted for brevity."
+        )
+    except json.JSONDecodeError:
+        return "// Could not parse package.json, showing raw content.\n" + content
+
+def _summarize_requirements_txt(content: str) -> str:
+    """Summarizes requirements.txt to a single line."""
+    line_count = len(content.strip().splitlines())
+    return f"// Contains {line_count} dependencies, including Flask, SQLAlchemy, etc."
+
+
 CONFIG = {
     "EXCLUDE_DIRS_DEFAULT": {
         '.git', 'venv', '__pycache__', 'node_modules', '.pytest_cache', 'build', 'dist',
-        'htmlcov', '.mypy_cache', 'reports', 'data',  # 'backup' is removed to allow discovery
+        'htmlcov', '.mypy_cache', 'reports', 'data', 'ui_screenshots', 'backup', # Exclude backup dir entirely
     },
     "EXCLUDE_FILES_DEFAULT": {
         '.DS_Store', '.gitignore', 'package-lock.json', 'yarn.lock',
-        '.env', '.env.test', '.env.example',
-        'jest_detailed_results.json', 'coverage.xml', '.coverage',
+        '.env', '.env.test', '.env.example', 'jest_detailed_results.json',
+        'coverage.xml', '.coverage',
     },
     "EXCLUDE_PATTERNS_DEFAULT": [
         re.compile(r'.*_tokens.*\.txt$'),
-        re.compile(r'\.log$'),
-        re.compile(r'\.tmp$'),
-        re.compile(r'\.swp$'),
+        re.compile(r'\.log$'), re.compile(r'\.tmp$'), re.compile(r'\.swp$'),
+        re.compile(r'\.zip$'), re.compile(r'\.tar\.gz$'), re.compile(r'\.rar$'),
     ],
+    # === THE FIX IS HERE: .sql has been REMOVED from the default includes ===
     "INCLUDE_EXT_DEFAULT": {
-        '.py', '.js', '.jsx', '.ts', '.tsx', '.css', '.scss', '.md', '.json', '.sql',
+        '.py', '.js', '.jsx', '.ts', '.tsx', '.css', '.scss', '.md', '.json',
         '.ini', '.cfg', '.toml', '.yaml', '.yml', '.sh', '.bat', '.txt',
         '.mako', 'Dockerfile'
+    },
+    "TEST_FILE_PATTERN": re.compile(r'([._])(test|spec)\.(js|jsx|ts|tsx)$|^(test_)|(_test)\.py$', re.IGNORECASE),
+    "SUMMARIZE_FILES": {
+        'package.json': _summarize_package_json,
+        'requirements.txt': _summarize_requirements_txt,
     },
     "JSON_SAMPLE_CONFIG": {
         "max_lines": 50,
         "max_chars": 3000
     },
-    # New in v4: A pattern to identify common test file naming conventions.
-    "TEST_FILE_PATTERN": re.compile(r'([._])(test|spec)\.(js|jsx|ts|tsx)$', re.IGNORECASE),
-    "COMPLEX_PATTERNS": {
-        '.sql': [
-            # Pattern 1: Collapse all COPY data blocks (the biggest token saver)
-            (
-                re.compile(r'(^COPY public\..*? FROM stdin;\n)(.*?)(\n\\\.$\n)', re.DOTALL | re.MULTILINE),
-                lambda m: f"{m.group(1)}-- [SQL DATA OMITTED FOR BREVITY]\n{m.group(3)}",
-                "SQL_COPY_DATA"
-            ),
-            # Pattern 2: Remove all SQL comments
-            (
-                re.compile(r'^--.*?\n', re.MULTILINE),
-                "",
-                "SQL_COMMENTS"
-            ),
-            # Pattern 3: Remove all boilerplate SET statements
-            (
-                re.compile(r'^SET .*?;\n', re.MULTILINE),
-                "",
-                "SQL_SET_STATEMENTS"
-            ),
-            # Pattern 4: Remove sequence ownership and value setting
-            (
-                re.compile(r'^SELECT pg_catalog\.setval.*?;', re.MULTILINE | re.IGNORECASE),
-                "",
-                "SQL_SETVAL"
-            ),
-             # Pattern 5: Remove noisy ALTER TABLE ... ADD CONSTRAINT statements
-            (
-                re.compile(r'^ALTER TABLE .*? ADD CONSTRAINT .*?;\n', re.MULTILINE),
-                "",
-                "SQL_ADD_CONSTRAINT"
-            ),
-            # Pattern 6: Remove noisy CREATE INDEX statements
-            (
-                re.compile(r'^CREATE (UNIQUE )?INDEX .*?;\n', re.MULTILINE),
-                "",
-                "SQL_CREATE_INDEX"
-            ),
-            # Pattern 7: Remove noisy ALTER TABLE ... OWNER TO ... statements
-            (
-                 re.compile(r'^ALTER (TABLE|TYPE|SEQUENCE) .*? OWNER TO .*?;\n', re.MULTILINE),
-                 "",
-                 "SQL_OWNER_TO"
-            ),
-             # Pattern 8: Remove sequence anmespace setting
-            (
-                 re.compile(r'^ALTER SEQUENCE .*? OWNED BY .*?;\n', re.MULTILINE),
-                 "",
-                 "SQL_SEQUENCE_OWNED_BY"
-            )
-        ]
-    }
 }
 
 # --- Logging Setup ---
@@ -103,12 +77,11 @@ def log_error(message): logger.error(message)
 
 def process_file_content(filepath: Path, content: str, args: argparse.Namespace, config: dict) -> str:
     """Processes file content based on file type and command-line arguments."""
+    filename = filepath.name
     ext = filepath.suffix.lower()
 
-    # Minify lines unless disabled
-    if not args.no_minify_lines:
-        lines = [line.strip() for line in content.splitlines()]
-        content = '\n'.join(filter(None, lines))
+    if filename in config["SUMMARIZE_FILES"]:
+        return config["SUMMARIZE_FILES"][filename](content)
 
     if ext == '.json' and not args.no_json_sample:
         try:
@@ -119,13 +92,11 @@ def process_file_content(filepath: Path, content: str, args: argparse.Namespace,
         except (json.JSONDecodeError, UnicodeDecodeError):
             pass
 
-    if ext in config["COMPLEX_PATTERNS"]:
-        for pattern, replacement, name in config["COMPLEX_PATTERNS"][ext]:
-            content, count = pattern.subn(replacement, content)
-            if count > 0:
-                log_info(f"  -> Applied pattern '{name}' and made {count} replacement(s).")
+    if not args.no_minify_lines:
+        lines = [line.strip() for line in content.splitlines()]
+        content = '\n'.join(filter(None, lines))
+        content = re.sub(r'\n{3,}', '\n\n', content)
     
-    content = re.sub(r'\n{3,}', '\n\n', content)
     return content
 
 def analyze_output(output_content: str):
@@ -150,73 +121,91 @@ def analyze_output(output_content: str):
         print(f"  - {ext:<12s}: {chars:>10,d} chars ({percentage:5.2f}%) [{count} file(s)]", file=sys.stderr)
     print("-"*40, file=sys.stderr)
 
+def _should_exclude(path: Path, args: argparse.Namespace, config: dict, output_abs_path: Path) -> bool:
+    """Helper function to determine if a file or directory should be excluded."""
+    # Check for forced inclusion first
+    if args.force_include:
+        for pattern in args.force_include:
+            if Path(pattern).match(str(path)):
+                return False # Do not exclude, force include
+
+    # Directory checks
+    for part in path.parts:
+        if part in config["EXCLUDE_DIRS_DEFAULT"] or part in args.ignore_dir:
+            return True
+
+    # Test file/directory checks
+    if not args.include_tests:
+        if any(part == 'tests' for part in path.parts):
+            return True
+        if config["TEST_FILE_PATTERN"] and config["TEST_FILE_PATTERN"].search(path.name):
+            return True
+
+    # Specific file checks
+    if path.name in config["EXCLUDE_FILES_DEFAULT"] or path.name in args.ignore_file:
+        return True
+    if path.resolve() == output_abs_path:
+        return True
+    if any(p.search(path.name) for p in config["EXCLUDE_PATTERNS_DEFAULT"]):
+        return True
+        
+    # Extension-based checks should ONLY apply to files.
+    if path.is_file():
+        ext = path.suffix.lower()
+        if args.ignore_all_txt and ext == '.txt' and path.name.lower() != 'requirements.txt':
+            return True
+        if args.ignore_extension and ext in args.ignore_extension:
+            return True
+        if ext not in config["INCLUDE_EXT_DEFAULT"]:
+            return True
+
+    return False
+
 def discover_files(path: Path, config: dict, args: argparse.Namespace, output_abs_path: Path) -> list[Path]:
-    """
-    Recursively discovers all files in a path that match the include/exclude criteria.
-    Returns a list of Path objects.
-    """
+    """Recursively discovers all files in a path that match the include/exclude criteria."""
     discovered_paths = []
     
     if path.is_file():
-        # Handle the case where the root_path is a single file
-        if path.resolve() != output_abs_path and path.suffix.lower() in config["INCLUDE_EXT_DEFAULT"]:
+        if not _should_exclude(path, args, config, output_abs_path):
             discovered_paths.append(path)
         return discovered_paths
-
-    test_file_pattern = config.get("TEST_FILE_PATTERN")
 
     for root, dirs, files in os.walk(path, topdown=True):
         current_dir = Path(root)
         
-        # --- Directory exclusion logic ---
-        dirs[:] = [d for d in dirs if d not in config["EXCLUDE_DIRS_DEFAULT"] and d not in args.ignore_dir]
-        # 1. Old method: Exclude any directory named 'tests'
-        if not args.include_tests and 'tests' in dirs:
-            dirs.remove('tests')
+        # This is more efficient: filter dirs in-place to prevent os.walk from descending further.
+        dirs[:] = [d for d in dirs if not _should_exclude(current_dir / d, args, config, output_abs_path)]
         
         for f in files:
-            # --- File exclusion logic ---
-            
-            # 2. New method: Exclude files matching test pattern (e.g., *.test.js)
-            if not args.include_tests and test_file_pattern and test_file_pattern.search(f):
-                continue
-            
             file_path = current_dir / f
-            ext = file_path.suffix.lower()
-            
-            if file_path.resolve() == output_abs_path: continue
-            if args.ignore_all_txt and ext == '.txt' and file_path.name.lower() != 'requirements.txt': continue
-            if file_path.name in config["EXCLUDE_FILES_DEFAULT"] or file_path.name in args.ignore_file: continue
-            if any(p.match(f) for p in config["EXCLUDE_PATTERNS_DEFAULT"]): continue
-            if args.ignore_extension and ext in args.ignore_extension: continue
-            if ext not in config["INCLUDE_EXT_DEFAULT"]: continue
-            
-            discovered_paths.append(file_path)
+            if not _should_exclude(file_path, args, config, output_abs_path):
+                discovered_paths.append(file_path)
             
     return discovered_paths
 
 def main():
     parser = argparse.ArgumentParser(
-        description="A powerful tool to concatenate and process project files into a single text file for LLM context.",
+        description="v5.2: A powerful tool to concatenate project files into a single text file for LLM context.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("root_path", type=Path, help="The root directory or specific file to process.")
-    parser.add_argument("-o", "--output", type=Path, default="project_tokens.txt", help="Output file name.")
-    parser.add_argument(
-        "--additional-context-folder", type=Path, default=None,
-        help="Optional: A path to an additional folder to include in the context."
-    )
     
-    parser.add_argument("--include-tests", action="store_true", help="Include test files and 'tests' directories in the output.")
-    parser.add_argument("--ignore-dir", action="append", default=[], help="Specify directory names to ignore.")
-    parser.add_argument("--ignore-file", action="append", default=[], help="Specify file names to ignore.")
-    parser.add_argument("--ignore-extension", action="append", default=[], help="Specify file extensions to ignore (e.g., .log).")
+    path_group = parser.add_argument_group("Path Control")
+    path_group.add_argument("root_path", type=Path, help="The root directory or specific file to process.")
+    path_group.add_argument("-o", "--output", type=Path, default="project_tokens.txt", help="Output file name.")
+    path_group.add_argument("--additional-context-folder", type=Path, default=None, help="Optional: A path to an additional folder to include in the context.")
+
+    filter_group = parser.add_argument_group("Filtering Options")
+    filter_group.add_argument("--include-tests", action="store_true", help="Include test files (e.g., *_test.py, *.test.js) and 'tests' directories.")
+    filter_group.add_argument("--force-include", action="append", default=[], help="File patterns to include even if they would normally be excluded (e.g., '*/important.log').")
+    filter_group.add_argument("--ignore-dir", action="append", default=[], help="Additional directory names to ignore.")
+    filter_group.add_argument("--ignore-file", action="append", default=[], help="Additional file names to ignore.")
+    filter_group.add_argument("--ignore-extension", action="append", default=[], help="File extensions to ignore (e.g., .log).")
+    filter_group.add_argument("--ignore-all-txt", action="store_true", help="Ignore all .txt files except for 'requirements.txt'.")
     
-    parser.add_argument("--ignore-all-txt", action="store_true", help="Ignore all .txt files except for 'requirements.txt'.")
-    
-    parser.add_argument("--no-minify-lines", action="store_true", help="Do not remove blank lines or strip whitespace from lines.")
-    parser.add_argument("--no-json-sample", action="store_true", help="Include the full content of large JSON files.")
-    
+    format_group = parser.add_argument_group("Output Formatting")
+    format_group.add_argument("--no-minify-lines", action="store_true", help="Do not remove blank lines or strip whitespace from lines.")
+    format_group.add_argument("--no-json-sample", action="store_true", help="Include the full content of large JSON files.")
+
     args = parser.parse_args()
 
     if not args.root_path.exists():
@@ -225,70 +214,50 @@ def main():
     output_abs_path = args.output.resolve()
     output_abs_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # --- 1. Discover all potential files ---
     all_discovered_files = set()
-    
     log_info(f"--- Discovering files in Primary Path: {args.root_path} ---")
     all_discovered_files.update(discover_files(args.root_path, CONFIG, args, output_abs_path))
 
-    if args.additional_context_folder and args.additional_context_folder.is_dir():
-        log_info(f"--- Discovering files in Additional Context Folder: {args.additional_context_folder} ---")
-        all_discovered_files.update(discover_files(args.additional_context_folder, CONFIG, args, output_abs_path))
-    elif args.additional_context_folder:
-        log_warn(f"Additional context folder specified but not found: {args.additional_context_folder}")
-
-    # --- 2. Apply special filtering for backup files ---
-    backup_sql_files = []
-    other_files = []
-    for file_path in all_discovered_files:
-        if file_path.parent.name == 'backup' and file_path.suffix.lower() == '.sql':
-            backup_sql_files.append(file_path)
+    if args.additional_context_folder:
+        if args.additional_context_folder.exists():
+            log_info(f"--- Discovering files in Additional Context Folder: {args.additional_context_folder} ---")
+            all_discovered_files.update(discover_files(args.additional_context_folder, CONFIG, args, output_abs_path))
         else:
-            other_files.append(file_path)
+            log_warn(f"Additional context folder specified but not found: {args.additional_context_folder}")
 
-    final_files_to_process = other_files
-    if backup_sql_files:
-        # Find the latest .sql file in the backup directory by modification time
-        latest_backup_file = max(backup_sql_files, key=os.path.getmtime)
-        log_info(f"Found {len(backup_sql_files)} SQL backup files. Selecting the latest: {latest_backup_file.name}")
-        final_files_to_process.append(latest_backup_file)
+    # No longer need special handling for backups, they are excluded by default.
+    final_files_to_process = sorted(list(all_discovered_files))
         
-    # Sort the final list for consistent output
-    final_files_to_process.sort()
+    with args.output.open('w', encoding='utf-8') as f_out:
+        f_out.write(f"--- START OF FILE {args.output.name} ---\n\n")
+        primary_desc = "folder" if args.root_path.is_dir() else "file"
+        f_out.write(f"# Compressed Representation of Primary {primary_desc}: {args.root_path}\n\n")
 
-    # --- 3. Process the final, filtered list of files ---
-    output_content_parts = [f"--- START OF FILE {args.output.name} ---\n\n"]
-    
-    primary_description = "folder" if args.root_path.is_dir() else "file"
-    output_content_parts.append(f"# Compressed Representation of Primary {primary_description}: {args.root_path}\n\n")
-
-    for file_path in final_files_to_process:
-        try:
-            # Safely create a relative path string
+        for file_path in final_files_to_process:
             try:
-                relative_file_path_str = file_path.relative_to(args.root_path).as_posix()
-            except ValueError:
-                relative_file_path_str = str(file_path)
-                
-            log_info(f"Processing file: {relative_file_path_str}")
-            content = file_path.read_text(encoding='utf-8', errors='ignore')
-            if content.strip():
-                processed_content = process_file_content(file_path, content, args, CONFIG)
-                output_content_parts.append(f"--- File: {relative_file_path_str} ---\n")
-                output_content_parts.append(processed_content)
-                output_content_parts.append(f"\n--- End File: {relative_file_path_str} ---\n")
-        except Exception as e:
-            log_error(f"Could not process file {file_path}: {e}")
+                relative_path_str = str(file_path)
+                try:
+                    # Attempt to make path relative to CWD for cleaner output if possible
+                    relative_path_str = str(file_path.relative_to(Path.cwd()))
+                except ValueError:
+                    # If it's on a different drive or path, use the absolute path
+                    pass
 
-    output_content_parts.append("\n--- END OF FILE ---")
-    final_output_content = "".join(output_content_parts)
-    
-    try:
-        args.output.write_text(final_output_content, encoding='utf-8')
-        log_info(f"\nProcessing complete. Output written to {args.output}")
-        analyze_output(final_output_content)
-    except Exception as e:
-        log_error(f"Failed to write to output file {args.output}: {e}")
+                log_info(f"Processing file: {relative_path_str}")
+                content = file_path.read_text(encoding='utf-8', errors='ignore')
+                if content.strip():
+                    processed_content = process_file_content(file_path, content, args, CONFIG)
+                    f_out.write(f"--- File: {relative_path_str} ---\n")
+                    f_out.write(processed_content)
+                    f_out.write(f"\n--- End File: {relative_path_str} ---\n")
+            except Exception as e:
+                log_error(f"Could not process file {file_path}: {e}")
+
+        f_out.write("\n--- END OF FILE ---")
+
+    log_info(f"\nProcessing complete. Output written to {args.output}")
+    with args.output.open('r', encoding='utf-8') as f_in:
+        analyze_output(f_in.read())
 
 if __name__ == '__main__':
     main()
