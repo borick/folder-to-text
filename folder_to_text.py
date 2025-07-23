@@ -1,3 +1,5 @@
+# folder_to_text.py
+
 import argparse
 import os
 import re
@@ -7,257 +9,272 @@ from pathlib import Path
 from datetime import datetime
 import sys
 from collections import defaultdict
+import ast
 
 # --- Configuration ---
-# Version 5.2: Excluded .sql files by default for better compression.
+# Version 10.1: Fixed a critical bug where the DocstringRemover class was missing, causing errors on all .py files.
+# - Summarization is the DEFAULT behavior. Use --full-code to disable it.
+# - AST-based summarization for Python files to show structure-only.
+# - New dependency: NLTK for prose stripping in documentation files.
+# - New flag --strip-prose to remove filler words from .md files.
+# - New concise header format: [FILE: path/to/file.ext]
+
 
 def _summarize_package_json(content: str) -> str:
-    """Summarizes package.json to its most essential parts for LLM context."""
+    """Summarizes package.json to its most essential parts."""
     try:
         data = json.loads(content)
         summary = {
-            "name": data.get("name"),
-            "version": data.get("version"),
-            "scripts": data.get("scripts"),
+            "name": data.get("name"), "version": data.get("version"), "scripts": data.get("scripts"),
         }
-        return (
-            f"// Summarized package.json. Key details:\n"
-            f"{json.dumps(summary, indent=2)}\n"
-            f"// Dependencies are omitted for brevity."
-        )
+        return f"// Summarized package.json. Key details:\n{json.dumps(summary, indent=2)}\n// Dependencies omitted."
     except json.JSONDecodeError:
         return "// Could not parse package.json, showing raw content.\n" + content
 
 def _summarize_requirements_txt(content: str) -> str:
-    """Summarizes requirements.txt to a single line."""
-    line_count = len(content.strip().splitlines())
-    return f"// Contains {line_count} dependencies, including Flask, SQLAlchemy, etc."
+    """Summarizes requirements.txt."""
+    return f"// Contains {len(content.strip().splitlines())} dependencies."
+
+
+# === START: BUG FIX - The missing DocstringRemover class is now included. ===
+class DocstringRemover(ast.NodeTransformer):
+    """AST transformer to remove docstrings from Python code."""
+    def visit_FunctionDef(self, node):
+        if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, (ast.Str, ast.Constant)):
+            node.body.pop(0)
+        self.generic_visit(node)
+        return node
+    def visit_ClassDef(self, node):
+        if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, (ast.Str, ast.Constant)):
+            node.body.pop(0)
+        self.generic_visit(node)
+        return node
+    def visit_Module(self, node):
+        if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, (ast.Str, ast.Constant)):
+            node.body.pop(0)
+        self.generic_visit(node)
+        return node
+# === END: BUG FIX ===
+
+
+class CodeSummarizer(ast.NodeTransformer):
+    """AST transformer to replace function/class bodies with 'pass'."""
+    def visit_FunctionDef(self, node):
+        node.body = [ast.Pass()]
+        self.generic_visit(node)
+        return node
+    def visit_AsyncFunctionDef(self, node):
+        node.body = [ast.Pass()]
+        self.generic_visit(node)
+        return node
+    def visit_ClassDef(self, node):
+        new_body = []
+        for body_item in node.body:
+            if isinstance(body_item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                body_item.body = [ast.Pass()]
+                new_body.append(body_item)
+            elif isinstance(body_item, ast.Expr) and isinstance(body_item.value, (ast.Str, ast.Constant)):
+                continue
+            else:
+                new_body.append(body_item)
+        node.body = new_body if new_body else [ast.Pass()]
+        self.generic_visit(node)
+        return node
 
 
 CONFIG = {
     "EXCLUDE_DIRS_DEFAULT": {
-        '.git', 'venv', '__pycache__', 'node_modules', '.pytest_cache', 'build', 'dist',
-        'htmlcov', '.mypy_cache', 'reports', 'data', 'ui_screenshots', 'backup', # Exclude backup dir entirely
+        ".git", "venv", "__pycache__", "node_modules", ".pytest_cache", "build", "dist",
+        "htmlcov", ".mypy_cache", "reports", "data", "ui_screenshots", "backup", "legacy", ".vscode",
     },
     "EXCLUDE_FILES_DEFAULT": {
-        '.DS_Store', '.gitignore', 'package-lock.json', 'yarn.lock',
-        '.env', '.env.test', '.env.example', 'jest_detailed_results.json',
-        'coverage.xml', '.coverage',
+        ".DS_Store", ".gitignore", "package-lock.json", "yarn.lock", ".env", ".env.test",
     },
-    "EXCLUDE_PATTERNS_DEFAULT": [
-        re.compile(r'.*_tokens.*\.txt$'),
-        re.compile(r'\.log$'), re.compile(r'\.tmp$'), re.compile(r'\.swp$'),
-        re.compile(r'\.zip$'), re.compile(r'\.tar\.gz$'), re.compile(r'\.rar$'),
-    ],
-    # === THE FIX IS HERE: .sql has been REMOVED from the default includes ===
-    "INCLUDE_EXT_DEFAULT": {
-        '.py', '.js', '.jsx', '.ts', '.tsx', '.css', '.scss', '.md', '.json',
-        '.ini', '.cfg', '.toml', '.yaml', '.yml', '.sh', '.bat', '.txt',
-        '.mako', 'Dockerfile'
-    },
-    "TEST_FILE_PATTERN": re.compile(r'([._])(test|spec)\.(js|jsx|ts|tsx)$|^(test_)|(_test)\.py$', re.IGNORECASE),
+    "EXCLUDE_PATTERNS_DEFAULT": [re.compile(r".*project_context_.*\.txt$"), re.compile(r"\.log$")],
+    "ALWAYS_INCLUDE_FILES": {"requirements.txt", "package.json"},
+    "CORE_EXTENSIONS": {".py", ".js", ".jsx", ".ts", ".tsx", ".sh", "Dockerfile", ".env.example"},
+    "DOCS_EXTENSIONS": {".md"},
+    "CONFIG_EXTENSIONS": {".json", ".yml", ".yaml", ".toml", ".cfg", ".ini"},
+    "TEST_FILE_PATTERN": re.compile(r"([._])(test|spec)\.(js|jsx|ts|tsx)$|^(test_)|(_test)\.py$", re.IGNORECASE),
     "SUMMARIZE_FILES": {
-        'package.json': _summarize_package_json,
-        'requirements.txt': _summarize_requirements_txt,
-    },
-    "JSON_SAMPLE_CONFIG": {
-        "max_lines": 50,
-        "max_chars": 3000
+        "package.json": _summarize_package_json,
+        "requirements.txt": _summarize_requirements_txt,
     },
 }
 
-# --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s', stream=sys.stderr)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr)
 logger = logging.getLogger(__name__)
 
-# --- Helper Functions ---
-def log_info(message): logger.info(message)
-def log_warn(message): logger.warning(message)
-def log_error(message): logger.error(message)
+def _check_nltk_stopwords():
+    try:
+        from nltk.corpus import stopwords
+        stopwords.words('english')
+    except ImportError:
+        logger.error("NLTK library not found. Please run: pip install nltk")
+        sys.exit(1)
+    except LookupError:
+        logger.error("NLTK 'stopwords' corpus not found.")
+        logger.error("Please run the following command to download it:")
+        logger.error("python -m nltk.downloader stopwords")
+        sys.exit(1)
 
-def process_file_content(filepath: Path, content: str, args: argparse.Namespace, config: dict) -> str:
-    """Processes file content based on file type and command-line arguments."""
+def _summarize_python_with_ast(content: str, filepath: Path) -> str:
+    try:
+        tree = ast.parse(content)
+        tree = DocstringRemover().visit(tree)
+        tree = CodeSummarizer().visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree)
+    except (SyntaxError, ValueError) as e:
+        logger.warning(f"Could not summarize {filepath} with AST due to syntax error: {e}. Including full content instead.")
+        return content
+
+def _strip_prose_with_nltk(content: str) -> str:
+    from nltk.corpus import stopwords
+    from nltk.tokenize import word_tokenize
+    import string
+    stop_words = set(stopwords.words('english'))
+    tokens = word_tokenize(content)
+    filtered_words = [word for word in tokens if word.lower() not in stop_words and word not in string.punctuation]
+    return ' '.join(filtered_words)
+
+def process_file_content(filepath: Path, content: str, args: argparse.Namespace) -> str:
     filename = filepath.name
+    if filename in CONFIG["SUMMARIZE_FILES"]:
+        return CONFIG["SUMMARIZE_FILES"][filename](content)
+
+    processed_content = content
     ext = filepath.suffix.lower()
 
-    if filename in config["SUMMARIZE_FILES"]:
-        return config["SUMMARIZE_FILES"][filename](content)
-
-    if ext == '.json' and not args.no_json_sample:
-        try:
-            if len(content.splitlines()) > config["JSON_SAMPLE_CONFIG"]["max_lines"] or len(content) > config["JSON_SAMPLE_CONFIG"]["max_chars"]:
-                json.loads(content)
-                sampled_content = '\n'.join(content.splitlines()[:config["JSON_SAMPLE_CONFIG"]["max_lines"]])
-                return f"// Sample representation of the original JSON file.\n{sampled_content}"
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            pass
+    if not args.full_code:
+        if ext == ".py":
+            processed_content = _summarize_python_with_ast(processed_content, filepath)
+    
+    if args.strip_prose and ext in CONFIG["DOCS_EXTENSIONS"]:
+        processed_content = _strip_prose_with_nltk(processed_content)
 
     if not args.no_minify_lines:
-        lines = [line.strip() for line in content.splitlines()]
-        content = '\n'.join(filter(None, lines))
-        content = re.sub(r'\n{3,}', '\n\n', content)
-    
-    return content
+        lines = [line.rstrip() for line in processed_content.splitlines()]
+        processed_content = "\n".join(filter(None, lines))
+
+    final_lines = []
+    for line in processed_content.splitlines():
+        match = re.match(r"^(\s+)", line)
+        if match:
+            final_lines.append("\t" + line.lstrip())
+        else:
+            final_lines.append(line)
+    return "\n".join(final_lines)
 
 def analyze_output(output_content: str):
-    """Provides a report on the generated content."""
-    analysis = {"total_chars": len(output_content), "by_type": defaultdict(lambda: {"chars": 0, "count": 0})}
-    file_pattern = re.compile(r"--- File: (.*?) ---\n(.*?)(?=\n--- End File:|\Z)", re.DOTALL)
-    
+    file_pattern = re.compile(r"\[FILE: (.*?)\]\n(.*?)(?=\n\n\[FILE:|\Z)", re.DOTALL)
+    analysis = {"total_chars": 0, "by_type": defaultdict(lambda: {"chars": 0, "count": 0})}
     for match in file_pattern.finditer(output_content):
         file_path_str, file_content = match.groups()
-        ext = f".{file_path_str.split('.')[-1]}" if '.' in file_path_str else ".other"
-        analysis["by_type"][ext]["chars"] += len(file_content)
+        ext = f".{file_path_str.split('.')[-1]}" if "." in file_path_str else ".other"
+        content_char_count = len(file_content)
+        analysis["total_chars"] += content_char_count
+        analysis["by_type"][ext]["chars"] += content_char_count
         analysis["by_type"][ext]["count"] += 1
-        
-    print("\n" + "-"*40, file=sys.stderr)
-    print("Content Analysis Report (on final output):", file=sys.stderr)
-    print(f"Total Output Characters: {analysis['total_chars']:,}", file=sys.stderr)
-    print("-"*40, file=sys.stderr)
-    sorted_types = sorted(analysis["by_type"].items(), key=lambda item: item[1]['chars'], reverse=True)
+    
+    print("\n" + "-" * 40, file=sys.stderr)
+    print("Content Analysis Report:", file=sys.stderr)
+    print(f"Total Content Characters: {analysis['total_chars']:,}", file=sys.stderr)
+    print("-" * 40, file=sys.stderr)
+    sorted_types = sorted(analysis["by_type"].items(), key=lambda item: item[1]["chars"], reverse=True)
     for ext, data in sorted_types:
-        chars, count = data['chars'], data['count']
+        chars, count = data["chars"], data["count"]
         percentage = (chars / analysis["total_chars"]) * 100 if analysis["total_chars"] > 0 else 0
         print(f"  - {ext:<12s}: {chars:>10,d} chars ({percentage:5.2f}%) [{count} file(s)]", file=sys.stderr)
-    print("-"*40, file=sys.stderr)
+    print("-" * 40, file=sys.stderr)
 
-def _should_exclude(path: Path, args: argparse.Namespace, config: dict, output_abs_path: Path) -> bool:
-    """Helper function to determine if a file or directory should be excluded."""
-    # Check for forced inclusion first
-    if args.force_include:
-        for pattern in args.force_include:
-            if Path(pattern).match(str(path)):
-                return False # Do not exclude, force include
-
-    # Directory checks
+def _should_exclude(path: Path, args: argparse.Namespace, config: dict, output_abs_path: Path, include_exts: set) -> bool:
+    if path.name.lower() in config["ALWAYS_INCLUDE_FILES"]: return False
     for part in path.parts:
-        if part in config["EXCLUDE_DIRS_DEFAULT"] or part in args.ignore_dir:
-            return True
-
-    # Test file/directory checks
-    if not args.include_tests:
-        if any(part == 'tests' for part in path.parts):
-            return True
-        if config["TEST_FILE_PATTERN"] and config["TEST_FILE_PATTERN"].search(path.name):
-            return True
-
-    # Specific file checks
-    if path.name in config["EXCLUDE_FILES_DEFAULT"] or path.name in args.ignore_file:
-        return True
-    if path.resolve() == output_abs_path:
-        return True
-    if any(p.search(path.name) for p in config["EXCLUDE_PATTERNS_DEFAULT"]):
-        return True
-        
-    # Extension-based checks should ONLY apply to files.
+        if part in config["EXCLUDE_DIRS_DEFAULT"] or part in args.ignore_dir: return True
+    if not args.include_tests and (any(part == "tests" for part in path.parts) or
+                                  (config["TEST_FILE_PATTERN"] and config["TEST_FILE_PATTERN"].search(path.name))): return True
+    if path.name in config["EXCLUDE_FILES_DEFAULT"] or path.name in args.ignore_file or path.resolve() == output_abs_path: return True
+    if any(p.search(path.name) for p in config["EXCLUDE_PATTERNS_DEFAULT"]): return True
     if path.is_file():
-        ext = path.suffix.lower()
-        if args.ignore_all_txt and ext == '.txt' and path.name.lower() != 'requirements.txt':
-            return True
-        if args.ignore_extension and ext in args.ignore_extension:
-            return True
-        if ext not in config["INCLUDE_EXT_DEFAULT"]:
-            return True
-
+        ext = path.suffix.lower() if path.suffix else path.name
+        if ext not in include_exts: return True
     return False
 
-def discover_files(path: Path, config: dict, args: argparse.Namespace, output_abs_path: Path) -> list[Path]:
-    """Recursively discovers all files in a path that match the include/exclude criteria."""
+def discover_files(path: Path, config: dict, args: argparse.Namespace, output_abs_path: Path, include_exts: set) -> list[Path]:
     discovered_paths = []
-    
     if path.is_file():
-        if not _should_exclude(path, args, config, output_abs_path):
+        if not _should_exclude(path, args, config, output_abs_path, include_exts):
             discovered_paths.append(path)
         return discovered_paths
-
     for root, dirs, files in os.walk(path, topdown=True):
         current_dir = Path(root)
-        
-        # This is more efficient: filter dirs in-place to prevent os.walk from descending further.
-        dirs[:] = [d for d in dirs if not _should_exclude(current_dir / d, args, config, output_abs_path)]
-        
+        dirs[:] = [d for d in dirs if not _should_exclude(current_dir / d, args, config, output_abs_path, include_exts)]
         for f in files:
             file_path = current_dir / f
-            if not _should_exclude(file_path, args, config, output_abs_path):
+            if not _should_exclude(file_path, args, config, output_abs_path, include_exts):
                 discovered_paths.append(file_path)
-            
     return discovered_paths
 
 def main():
     parser = argparse.ArgumentParser(
-        description="v5.2: A powerful tool to concatenate project files into a single text file for LLM context.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="v10.1: An intelligent code summarizer for LLM context generation. Defaults to a highly compressed, structure-only view of your code.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    
     path_group = parser.add_argument_group("Path Control")
     path_group.add_argument("root_path", type=Path, help="The root directory or specific file to process.")
-    path_group.add_argument("-o", "--output", type=Path, default="project_tokens.txt", help="Output file name.")
-    path_group.add_argument("--additional-context-folder", type=Path, default=None, help="Optional: A path to an additional folder to include in the context.")
+    path_group.add_argument("-o", "--output", type=Path, default="project_context.txt", help="Output file name.")
 
-    filter_group = parser.add_argument_group("Filtering Options")
-    filter_group.add_argument("--include-tests", action="store_true", help="Include test files (e.g., *_test.py, *.test.js) and 'tests' directories.")
-    filter_group.add_argument("--force-include", action="append", default=[], help="File patterns to include even if they would normally be excluded (e.g., '*/important.log').")
-    filter_group.add_argument("--ignore-dir", action="append", default=[], help="Additional directory names to ignore.")
-    filter_group.add_argument("--ignore-file", action="append", default=[], help="Additional file names to ignore.")
-    filter_group.add_argument("--ignore-extension", action="append", default=[], help="File extensions to ignore (e.g., .log).")
-    filter_group.add_argument("--ignore-all-txt", action="store_true", help="Ignore all .txt files except for 'requirements.txt'.")
+    inclusion_group = parser.add_argument_group("Inclusion Controls (Lean by Default)")
+    inclusion_group.add_argument("--full-code", action="store_true", help="Disables summarization and includes the full, unabridged content of all files.")
+    inclusion_group.add_argument("--include-tests", action="store_true", help="Include test files and 'tests' directories.")
+    inclusion_group.add_argument("--include-docs", action="store_true", help="Include documentation files (.md).")
+    inclusion_group.add_argument("--include-config", action="store_true", help="Include common config files (.json, .yml, etc.).")
     
-    format_group = parser.add_argument_group("Output Formatting")
-    format_group.add_argument("--no-minify-lines", action="store_true", help="Do not remove blank lines or strip whitespace from lines.")
-    format_group.add_argument("--no-json-sample", action="store_true", help="Include the full content of large JSON files.")
+    exclusion_group = parser.add_argument_group("Exclusion Controls")
+    exclusion_group.add_argument("--ignore-dir", action="append", default=[], help="Additional directory names to ignore.")
+    exclusion_group.add_argument("--ignore-file", action="append", default=[], help="Additional file names to ignore.")
+
+    format_group = parser.add_argument_group("Advanced Compression")
+    format_group.add_argument("--strip-prose", action="store_true", help="Use NLTK to remove common English filler words from documentation files (.md). Requires 'pip install nltk'.")
+    format_group.add_argument("--no-minify-lines", action="store_true", help="Preserve blank lines and original line structure (disables default line minification).")
 
     args = parser.parse_args()
 
+    if args.strip_prose: _check_nltk_stopwords()
     if not args.root_path.exists():
-        log_error(f"Path '{args.root_path}' does not exist."); return
+        logger.error(f"Path '{args.root_path}' does not exist."); return
 
+    include_extensions = set(CONFIG["CORE_EXTENSIONS"])
+    if args.include_docs: include_extensions.update(CONFIG["DOCS_EXTENSIONS"])
+    if args.include_config: include_extensions.update(CONFIG["CONFIG_EXTENSIONS"])
+    
     output_abs_path = args.output.resolve()
     output_abs_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    all_discovered_files = set()
-    log_info(f"--- Discovering files in Primary Path: {args.root_path} ---")
-    all_discovered_files.update(discover_files(args.root_path, CONFIG, args, output_abs_path))
+    final_files_to_process = sorted(discover_files(args.root_path, CONFIG, args, output_abs_path, include_extensions))
 
-    if args.additional_context_folder:
-        if args.additional_context_folder.exists():
-            log_info(f"--- Discovering files in Additional Context Folder: {args.additional_context_folder} ---")
-            all_discovered_files.update(discover_files(args.additional_context_folder, CONFIG, args, output_abs_path))
-        else:
-            log_warn(f"Additional context folder specified but not found: {args.additional_context_folder}")
-
-    # No longer need special handling for backups, they are excluded by default.
-    final_files_to_process = sorted(list(all_discovered_files))
-        
-    with args.output.open('w', encoding='utf-8') as f_out:
-        f_out.write(f"--- START OF FILE {args.output.name} ---\n\n")
-        primary_desc = "folder" if args.root_path.is_dir() else "file"
-        f_out.write(f"# Compressed Representation of Primary {primary_desc}: {args.root_path}\n\n")
-
+    with args.output.open("w", encoding="utf-8") as f_out:
+        f_out.write(f"// LLM CONTEXT FOR: {args.root_path.name}\n")
+        f_out.write("// FORMATTING-RULES: 1. Content is a structural summary by default. 2. Files begin with '[FILE: path]'. 3. Indentation is a single tab.\n\n")
         for file_path in final_files_to_process:
             try:
-                relative_path_str = str(file_path)
-                try:
-                    # Attempt to make path relative to CWD for cleaner output if possible
-                    relative_path_str = str(file_path.relative_to(Path.cwd()))
-                except ValueError:
-                    # If it's on a different drive or path, use the absolute path
-                    pass
-
-                log_info(f"Processing file: {relative_path_str}")
-                content = file_path.read_text(encoding='utf-8', errors='ignore')
+                relative_path_str = str(file_path.relative_to(Path.cwd()))
+            except ValueError:
+                relative_path_str = str(file_path.resolve())
+            logger.info(f"Processing: {relative_path_str}")
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="ignore")
                 if content.strip():
-                    processed_content = process_file_content(file_path, content, args, CONFIG)
-                    f_out.write(f"--- File: {relative_path_str} ---\n")
+                    processed_content = process_file_content(file_path, content, args)
+                    f_out.write(f"[FILE: {relative_path_str}]\n")
                     f_out.write(processed_content)
-                    f_out.write(f"\n--- End File: {relative_path_str} ---\n")
+                    f_out.write("\n\n")
             except Exception as e:
-                log_error(f"Could not process file {file_path}: {e}")
+                logger.error(f"Could not process file {file_path}: {e}")
 
-        f_out.write("\n--- END OF FILE ---")
-
-    log_info(f"\nProcessing complete. Output written to {args.output}")
-    with args.output.open('r', encoding='utf-8') as f_in:
+    logger.info(f"\nProcessing complete. Output written to {args.output}")
+    with args.output.open("r", encoding="utf-8") as f_in:
         analyze_output(f_in.read())
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
