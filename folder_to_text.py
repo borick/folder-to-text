@@ -85,7 +85,7 @@ class CodeSummarizer(ast.NodeTransformer):
 CONFIG = {
     "EXCLUDE_DIRS_DEFAULT": {
         ".git", "venv", "__pycache__", "node_modules", ".pytest_cache", "build", "dist",
-        "htmlcov", ".mypy_cache", "reports", "data", "ui_screenshots", "backup", "legacy", ".vscode",
+        "htmlcov", ".mypy_cache", "data", "ui_screenshots", "backup", "legacy", ".vscode",
     },
     "EXCLUDE_FILES_DEFAULT": {
         ".DS_Store", ".gitignore", "package-lock.json", "yarn.lock", ".env", ".env.test",
