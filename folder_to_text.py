@@ -1,4 +1,4 @@
-# folder_to_text.py (v13.1 - line-based filtering in .contextignore)
+# folder_to_text.py (v14.0 - stdout, quiet, no-header, string replacements)
 
 import argparse
 import ast
@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Set
@@ -228,9 +229,14 @@ def process_file_content(
     content: str,
     args: argparse.Namespace,
     line_ignore_patterns: List[str],
+    string_replacements: Dict[str, str],
 ) -> str:
-    """Applies line removal, summarization, prose stripping, and compression."""
-    # First, remove any globally ignored lines.
+    """Applies replacements, line removal, summarization, and compression."""
+    # First, apply global string replacements.
+    for old, new in string_replacements.items():
+        content = content.replace(old, new)
+
+    # Second, remove any globally ignored lines.
     content = _remove_ignored_lines(content, line_ignore_patterns)
 
     filename, ext = filepath.name, filepath.suffix.lower()
@@ -267,17 +273,20 @@ def analyze_output(output_content: str):
         analysis["total_chars"] += char_count
         analysis["by_type"][ext]["chars"] += char_count
         analysis["by_type"][ext]["count"] += 1
-    print("\n" + "-" * 40)
-    print("Content Analysis Report:")
-    print(f"Total Characters: {analysis['total_chars']:,}")
-    print("-" * 40)
+    print("\n" + "-" * 40, file=sys.stderr)
+    print("Content Analysis Report:", file=sys.stderr)
+    print(f"Total Characters: {analysis['total_chars']:,}", file=sys.stderr)
+    print("-" * 40, file=sys.stderr)
     for ext, data in sorted(
         analysis["by_type"].items(), key=lambda i: i[1]["chars"], reverse=True
     ):
         chars, count = data["chars"], data["count"]
         pct = (chars / analysis["total_chars"]) * 100 if analysis["total_chars"] else 0
-        print(f"  - {ext:<10s}: {chars:>10,d} chars ({pct:5.2f}%) [{count} file(s)]")
-    print("-" * 40)
+        print(
+            f"  - {ext:<10s}: {chars:>10,d} chars ({pct:5.2f}%) [{count} file(s)]",
+            file=sys.stderr,
+        )
+    print("-" * 40, file=sys.stderr)
 
 
 # ---------- Tree View Generation ----------
@@ -307,12 +316,17 @@ def generate_tree_view(file_paths: List[Path], root_path: Path) -> str:
 
 
 # ---------- Discovery and Ignore Logic ----------
-def _parse_context_ignore(root_path: Path) -> Dict[str, List[str]]:
+def _parse_context_ignore(root_path: Path) -> Dict[str, Any]:
     """
-    Parses a .contextignore file for file glob patterns and line-based ignore strings.
+    Parses a .contextignore file for file patterns, line patterns,
+    and string replacements.
     """
     ignore_file = root_path / ".contextignore"
-    patterns = {"file_patterns": [], "line_patterns": []}
+    patterns: Dict[str, Any] = {
+        "file_patterns": [],
+        "line_patterns": [],
+        "string_replacements": {},
+    }
     if not ignore_file.is_file():
         return patterns
 
@@ -323,14 +337,32 @@ def _parse_context_ignore(root_path: Path) -> Dict[str, List[str]]:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
+
                 if line.lower() == "[lines-to-ignore]":
                     current_section = "line_patterns"
                     continue
-                patterns[current_section].append(line)
-        logger.info(
-            f"Loaded {len(patterns['file_patterns'])} file patterns and "
-            f"{len(patterns['line_patterns'])} line patterns from .contextignore"
-        )
+                elif line.lower() == "[string-replacements]":
+                    current_section = "string_replacements"
+                    continue
+
+                if current_section == "string_replacements":
+                    if "::" in line:
+                        old, new = line.split("::", 1)
+                        patterns["string_replacements"][old.strip()] = new.strip()
+                    else:
+                        logger.warning(
+                            f"Invalid replacement rule in .contextignore: {line}"
+                        )
+                else:
+                    patterns[current_section].append(line)
+
+        if not args.quiet:
+            logger.info(
+                f"Loaded from .contextignore: "
+                f"{len(patterns['file_patterns'])} file patterns, "
+                f"{len(patterns['line_patterns'])} line patterns, "
+                f"{len(patterns['string_replacements'])} string replacements."
+            )
     except Exception as e:
         logger.warning(f"Could not read .contextignore file: {e}")
     return patterns
@@ -366,7 +398,7 @@ def _should_exclude(
     if (
         path.name in CONFIG["EXCLUDE_FILES_DEFAULT"]
         or path.name in args.ignore_file
-        or path.resolve() == output_abs_path
+        or (output_abs_path and path.resolve() == output_abs_path)
     ):
         return True
     if any(p.search(path.name) for p in CONFIG["EXCLUDE_PATTERNS_DEFAULT"]):
@@ -400,7 +432,11 @@ def discover_files(
             d
             for d in dirs
             if not _should_exclude(
-                current_dir / d, args, output_abs_path, include_exts, file_ignore_patterns
+                current_dir / d,
+                args,
+                output_abs_path,
+                include_exts,
+                file_ignore_patterns,
             )
         ]
         for f in files:
@@ -413,48 +449,7 @@ def discover_files(
 
 
 # ---------- Main ----------
-def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "v13.1: Consolidate project folder into a single text file. "
-            "Supports .contextignore for file/line filtering, tree view, summarization, and compression."
-        ),
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("root_path", type=Path, help="Root directory or specific file.")
-    parser.add_argument(
-        "-o", "--output", type=Path, default="project_context.txt", help="Output file name."
-    )
-    parser.add_argument(
-        "--include-tests", action="store_true", help="Include test files/dirs."
-    )
-    parser.add_argument("--include-docs", action="store_true", help="Include docs (.md).")
-    parser.add_argument(
-        "--include-config", action="store_true", help="Include config files."
-    )
-    parser.add_argument("--ignore-dir", action="append", default=[], help="Dirs to ignore.")
-    parser.add_argument("--ignore-file", action="append", default=[], help="Files to ignore.")
-    parser.add_argument(
-        "--summarize", action="store_true", help="Summarize structure instead of full code."
-    )
-    parser.add_argument(
-        "--strip-prose",
-        action="store_true",
-        help="Strip common filler words from docs (zero-dependency).",
-    )
-    parser.add_argument(
-        "--no-minify-lines", action="store_true", help="Preserve blank lines and spacing."
-    )
-    parser.add_argument(
-        "--compress",
-        choices=["light", "medium", "aggressive"],
-        help="Compression level (default: medium).",
-    )
-    parser.add_argument(
-        "--tree", action="store_true", help="Prepend a directory tree view to the output."
-    )
-    args = parser.parse_args()
-
+def main(args: argparse.Namespace):
     if not args.root_path.exists():
         logger.error(f"Path '{args.root_path}' does not exist.")
         return
@@ -462,6 +457,7 @@ def main():
     ignore_config = _parse_context_ignore(args.root_path)
     file_ignore_patterns = ignore_config["file_patterns"]
     line_ignore_patterns = ignore_config["line_patterns"]
+    string_replacements = ignore_config["string_replacements"]
 
     include_exts = set(CONFIG["CORE_EXTENSIONS"])
     if args.include_docs:
@@ -469,47 +465,132 @@ def main():
     if args.include_config:
         include_exts.update(CONFIG["CONFIG_EXTENSIONS"])
 
-    output_abs = args.output.resolve()
-    output_abs.parent.mkdir(parents=True, exist_ok=True)
+    output_abs = None if args.stdout else args.output.resolve()
+    if output_abs:
+        output_abs.parent.mkdir(parents=True, exist_ok=True)
+
     files = sorted(
         discover_files(
             args.root_path, args, output_abs, include_exts, file_ignore_patterns
         )
     )
 
-    with output_abs.open("w", encoding="utf-8") as f_out:
-        f_out.write(f"// LLM CONTEXT FOR: {args.root_path.name}\n")
+    output_buffer = []
 
-        if args.tree:
-            tree_view = generate_tree_view(files, args.root_path)
-            f_out.write(tree_view)
+    def write_output(content):
+        if args.stdout:
+            print(content, end="")
+        else:
+            output_buffer.append(content)
 
-        f_out.write("// FORMAT: Each file starts with [FILE: path]\n\n")
-        for fp in files:
-            try:
-                rel_path = (
-                    str(fp.relative_to(Path.cwd()))
-                    if fp.is_relative_to(Path.cwd())
-                    else str(fp.resolve())
+    write_output(f"// LLM CONTEXT FOR: {args.root_path.name}\n")
+
+    if args.tree:
+        tree_view = generate_tree_view(files, args.root_path)
+        write_output(tree_view)
+
+    if not args.no_file_header:
+        write_output("// FORMAT: Each file starts with [FILE: path]\n\n")
+
+    for fp in files:
+        try:
+            rel_path_str = str(fp.relative_to(args.root_path))
+            for old, new in string_replacements.items():
+                rel_path_str = rel_path_str.replace(old, new)
+
+            if not args.quiet:
+                logger.info(f"Processing: {rel_path_str}")
+
+            text = fp.read_text(encoding="utf-8", errors="ignore")
+            if text.strip():
+                processed = process_file_content(
+                    fp, text, args, line_ignore_patterns, string_replacements
                 )
-            except ValueError:
-                rel_path = str(fp.resolve())
+                if not args.no_file_header:
+                    write_output(f"[FILE: {rel_path_str}]\n")
+                write_output(f"{processed}\n\n")
+        except Exception as e:
+            logger.error(f"Could not process {fp}: {e}")
 
-            logger.info(f"Processing: {rel_path}")
-            try:
-                text = fp.read_text(encoding="utf-8", errors="ignore")
-                if text.strip():
-                    processed = process_file_content(
-                        fp, text, args, line_ignore_patterns
-                    )
-                    f_out.write(f"[FILE: {rel_path}]\n{processed}\n\n")
-            except Exception as e:
-                logger.error(f"Could not process {fp}: {e}")
-
-    logger.info(f"\nProcessing complete. Output written to {args.output}")
-    with args.output.open("r", encoding="utf-8") as f_in:
-        analyze_output(f_in.read())
+    if not args.stdout and output_abs:
+        final_content = "".join(output_buffer)
+        output_abs.write_text(final_content, encoding="utf-8")
+        if not args.quiet:
+            logger.info(f"\nProcessing complete. Output written to {args.output}")
+        analyze_output(final_content)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description=(
+            "v14.0: Consolidate project folder into a single text file. "
+            "Supports .contextignore for file/line filtering and string replacements, "
+            "tree view, summarization, compression, and stdout."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("root_path", type=Path, help="Root directory or specific file.")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default="project_context.txt",
+        help="Output file name. Ignored if --stdout is used.",
+    )
+    parser.add_argument(
+        "--stdout", action="store_true", help="Print to standard output."
+    )
+    parser.add_argument(
+        "--quiet", action="store_true", help="Suppress progress logging."
+    )
+    parser.add_argument(
+        "--no-file-header",
+        action="store_true",
+        help="Omit the '[FILE: ...]' headers.",
+    )
+    parser.add_argument(
+        "--include-tests", action="store_true", help="Include test files/dirs."
+    )
+    parser.add_argument(
+        "--include-docs", action="store_true", help="Include docs (.md)."
+    )
+    parser.add_argument(
+        "--include-config", action="store_true", help="Include config files."
+    )
+    parser.add_argument(
+        "--ignore-dir", action="append", default=[], help="Dirs to ignore."
+    )
+    parser.add_argument(
+        "--ignore-file", action="append", default=[], help="Files to ignore."
+    )
+    parser.add_argument(
+        "--summarize",
+        action="store_true",
+        help="Summarize structure instead of full code.",
+    )
+    parser.add_argument(
+        "--strip-prose",
+        action="store_true",
+        help="Strip common filler words from docs (zero-dependency).",
+    )
+    parser.add_argument(
+        "--no-minify-lines",
+        action="store_true",
+        help="Preserve blank lines and spacing.",
+    )
+    parser.add_argument(
+        "--compress",
+        choices=["light", "medium", "aggressive"],
+        help="Compression level (default: medium).",
+    )
+    parser.add_argument(
+        "--tree",
+        action="store_true",
+        help="Prepend a directory tree view to the output.",
+    )
+    args = parser.parse_args()
+
+    if args.quiet:
+        logger.setLevel(logging.WARNING)
+
+    main(args)
