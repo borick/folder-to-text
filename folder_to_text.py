@@ -1,4 +1,4 @@
-# folder_to_text.py (v14.0 - stdout, quiet, no-header, string replacements)
+# folder_to_text.py (v15.4 - stdout, quiet, no-header, string replacements, shrink)
 
 import argparse
 import ast
@@ -9,7 +9,7 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 # --- Configuration ---
 CONFIG = {
@@ -59,6 +59,60 @@ CONFIG = {
         r"([._])(test|spec)\.(js|jsx|ts|tsx)$|^(test_)|(_test)\.py$", re.IGNORECASE
     ),
 }
+
+# Ordered list of (pattern, replacement) for token shrinking. Order is crucial.
+SHRINK_MAPPINGS: Dict[str, List[Tuple[str, str]]] = {
+    "python": [
+        ("__init__", "_init_"),
+        ("async def", "afn"),
+        ("self", "s"),
+        ("True", "T"),
+        ("False", "F"),
+        ("None", "N"),
+        ("elif", "|?"),
+        ("else", "|"),
+        ("if", "?"),
+        ("from", "<~"),
+        ("import", "~"),
+        ("return", "=>"),
+        ("def", "fn"),
+        ("class", "cls"),
+        ("await", "^"),
+        ("async", "a"),
+        ("and", "&"),
+        ("or", "|"),
+        ("not", "!"),
+        ("is", "="),
+        ("in", "e"),
+        ("print", "p"),
+    ],
+    "javascript": [
+        ("constructor", "_init_"),
+        ("function", "fn"),
+        ("export default", ">> def"),
+        ("export", ">>"),
+        ("default", "def"),
+        ("import", "~"),
+        ("from", "<~"),
+        ("const", "c!"),
+        ("let", "l!"),
+        ("var", "v!"),
+        ("return", "=>"),
+        ("class", "cls"),
+        ("else if", "|?"),
+        ("if", "?"),
+        ("else", "|"),
+        ("async", "a"),
+        ("await", "^"),
+        ("this", "t"),
+        ("true", "T"),
+        ("false", "F"),
+        ("null", "N"),
+        ("undefined", "U"),
+    ],
+}
+SHRINK_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx"}
+
 
 # A curated list of common English stop words for the zero-dependency prose stripper.
 STOP_WORDS: Set[str] = {
@@ -187,6 +241,79 @@ def _summarize_python_with_ast(content: str, filepath: Path) -> str:
         return content
 
 
+# ---------- Token Shrinking (Robust Implementation) ----------
+def _shrink_tokens(content: str, ext: str) -> str:
+    """
+    Replaces common keywords with shorter symbols using a robust multi-pass
+    approach that protects string literals and comments from being modified.
+    """
+    mapping_key = "python" if ext == ".py" else "javascript"
+    replacements = SHRINK_MAPPINGS.get(mapping_key, [])
+    if not replacements:
+        return content
+
+    # Safely create the pattern for matching triple-double-quoted strings to avoid SyntaxError
+    triple_double_quote_pattern = 'f?r?b?u?' + '"""' + '.*?' + '"""'
+
+    # Use an f-string to inject the safe pattern into the main regex.
+    # This avoids the parser error while keeping the regex readable.
+    string_comment_pattern = re.compile(
+        f"""
+        (
+            # Triple-quoted strings (Python)
+            f?r?b?u?'''.*?''' |
+            {triple_double_quote_pattern} |
+            # Single/double-quoted strings (Py/JS)
+            f?r?b?u?'.*?' |
+            f?r?b?u?".*?" |
+            # Template literals (JS)
+            `.*?` |
+            # Single-line comments (JS/TS)
+            //.*?$ |
+            # Single-line comments (Python)
+            #.*?$ |
+            # Multi-line comments (JS/TS)
+            /\\*.*?\\*/
+        )
+        """,
+        re.DOTALL | re.VERBOSE | re.MULTILINE,
+    )
+
+    # 1. Isolate strings and comments
+    protected_parts: List[str] = []
+    placeholders: List[str] = []
+
+    def protect(match):
+        placeholder = f"__PROTECTED_{len(protected_parts)}__"
+        protected_parts.append(match.group(0))
+        placeholders.append(placeholder)
+        return placeholder
+
+    safe_content = string_comment_pattern.sub(protect, content)
+
+    # 2. Apply shrinking to the "safe" code
+    for old, new in replacements:
+        pattern = r"\b" + re.escape(old) + r"\b"
+        safe_content = re.sub(pattern, new, safe_content)
+
+    # 3. Restore the protected parts
+    final_content = safe_content
+    for i, placeholder in enumerate(placeholders):
+        final_content = final_content.replace(placeholder, protected_parts[i], 1)
+
+    return final_content
+
+
+def generate_shrink_legend() -> str:
+    """Creates a legend explaining the token shrink transformations."""
+    legend = ["// TOKEN SHRINKING LEGEND (AI CONTEXT):"]
+    py_map = " | ".join([f"{o}->{n}" for o, n in SHRINK_MAPPINGS["python"]])
+    js_map = " | ".join([f"{o}->{n}" for o, n in SHRINK_MAPPINGS["javascript"]])
+    legend.append(f"// Python: {py_map}")
+    legend.append(f"// JS/TS: {js_map}")
+    return "\n".join(legend) + "\n\n"
+
+
 # ---------- Compression & Line Removal ----------
 def compress_content(content: str, level: str) -> str:
     """Applies various levels of compression to the file content."""
@@ -240,6 +367,11 @@ def process_file_content(
     content = _remove_ignored_lines(content, line_ignore_patterns)
 
     filename, ext = filepath.name, filepath.suffix.lower()
+
+    # Apply token shrinking if enabled and file type is supported
+    if args.shrink and ext in SHRINK_EXTENSIONS:
+        content = _shrink_tokens(content, ext)
+
     if args.summarize:
         if filename in SUMMARIZE_FILES:
             content = SUMMARIZE_FILES[filename](content)
@@ -485,6 +617,9 @@ def main(args: argparse.Namespace):
 
     write_output(f"// LLM CONTEXT FOR: {args.root_path.name}\n")
 
+    if args.shrink:
+        write_output(generate_shrink_legend())
+
     if args.tree:
         tree_view = generate_tree_view(files, args.root_path)
         write_output(tree_view)
@@ -523,9 +658,9 @@ def main(args: argparse.Namespace):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
-            "v14.0: Consolidate project folder into a single text file. "
-            "Supports .contextignore for file/line filtering and string replacements, "
-            "tree view, summarization, compression, and stdout."
+            "v15.4: Consolidate project folder into a single text file. "
+            "Supports .contextignore, tree view, summarization, compression, "
+            "and robust token shrinking for AI context optimization."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -587,6 +722,11 @@ if __name__ == "__main__":
         "--tree",
         action="store_true",
         help="Prepend a directory tree view to the output.",
+    )
+    parser.add_argument(
+        "--shrink",
+        action="store_true",
+        help="Apply token shrinking to supported code files (py, js, ts).",
     )
     args = parser.parse_args()
 
