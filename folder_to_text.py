@@ -1,4 +1,4 @@
-# folder_to_text.py (v15.4 - stdout, quiet, no-header, string replacements, shrink)
+# folder_to_text.py (v16.1 - Fix summarization/shrink order, JS/TS summarization)
 
 import argparse
 import ast
@@ -9,7 +9,7 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # --- Configuration ---
 CONFIG = {
@@ -116,26 +116,180 @@ SHRINK_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx"}
 
 # A curated list of common English stop words for the zero-dependency prose stripper.
 STOP_WORDS: Set[str] = {
-    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
-    "any", "are", "aren't", "as", "at", "be", "because", "been", "before",
-    "being", "below", "between", "both", "but", "by", "can", "can't", "cannot",
-    "could", "couldn't", "did", "didn't", "do", "does", "doesn't", "doing",
-    "don't", "down", "during", "each", "few", "for", "from", "further", "had",
-    "hadn't", "has", "hasn't", "have", "haven't", "having", "he", "he'd",
-    "he'll", "he's", "her", "here", "here's", "hers", "herself", "him",
-    "himself", "his", "how", "how's", "i", "i'd", "i'll", "i'm", "i've", "if",
-    "in", "into", "is", "isn't", "it", "it's", "its", "itself", "let's", "me",
-    "more", "most", "mustn't", "my", "myself", "no", "nor", "not", "of", "off",
-    "on", "once", "only", "or", "other", "ought", "our", "ours", "ourselves",
-    "out", "over", "own", "same", "shan't", "she", "she'd", "she'll", "she's",
-    "should", "shouldn't", "so", "some", "such", "than", "that", "that's",
-    "the", "their", "theirs", "them", "themselves", "then", "there", "there's",
-    "these", "they", "they'd", "they'll", "they're", "they've", "this", "those",
-    "through", "to", "too", "under", "until", "up", "very", "was", "wasn't",
-    "we", "we'd", "we'll", "we're", "we've", "were", "weren't", "what",
-    "what's", "when", "when's", "where", "where's", "which", "while", "who",
-    "who's", "whom", "why", "why's", "with", "won't", "would", "wouldn't",
-    "you", "you'd", "you'll", "you're", "you've", "your", "yours", "yourself",
+    "a",
+    "about",
+    "above",
+    "after",
+    "again",
+    "against",
+    "all",
+    "am",
+    "an",
+    "and",
+    "any",
+    "are",
+    "aren't",
+    "as",
+    "at",
+    "be",
+    "because",
+    "been",
+    "before",
+    "being",
+    "below",
+    "between",
+    "both",
+    "but",
+    "by",
+    "can",
+    "can't",
+    "cannot",
+    "could",
+    "couldn't",
+    "did",
+    "didn't",
+    "do",
+    "does",
+    "doesn't",
+    "doing",
+    "don't",
+    "down",
+    "during",
+    "each",
+    "few",
+    "for",
+    "from",
+    "further",
+    "had",
+    "hadn't",
+    "has",
+    "hasn't",
+    "have",
+    "haven't",
+    "having",
+    "he",
+    "he'd",
+    "he'll",
+    "he's",
+    "her",
+    "here",
+    "here's",
+    "hers",
+    "herself",
+    "him",
+    "himself",
+    "his",
+    "how",
+    "how's",
+    "i",
+    "i'd",
+    "i'll",
+    "i'm",
+    "i've",
+    "if",
+    "in",
+    "into",
+    "is",
+    "isn't",
+    "it",
+    "it's",
+    "its",
+    "itself",
+    "let's",
+    "me",
+    "more",
+    "most",
+    "mustn't",
+    "my",
+    "myself",
+    "no",
+    "nor",
+    "not",
+    "of",
+    "off",
+    "on",
+    "once",
+    "only",
+    "or",
+    "other",
+    "ought",
+    "our",
+    "ours",
+    "ourselves",
+    "out",
+    "over",
+    "own",
+    "same",
+    "shan't",
+    "she",
+    "she'd",
+    "she'll",
+    "she's",
+    "should",
+    "shouldn't",
+    "so",
+    "some",
+    "such",
+    "than",
+    "that",
+    "that's",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "there's",
+    "these",
+    "they",
+    "they'd",
+    "they'll",
+    "they're",
+    "they've",
+    "this",
+    "those",
+    "through",
+    "to",
+    "too",
+    "under",
+    "until",
+    "up",
+    "very",
+    "was",
+    "wasn't",
+    "we",
+    "we'd",
+    "we'll",
+    "we're",
+    "we've",
+    "were",
+    "weren't",
+    "what",
+    "what's",
+    "when",
+    "when's",
+    "where",
+    "where's",
+    "which",
+    "while",
+    "who",
+    "who's",
+    "whom",
+    "why",
+    "why's",
+    "with",
+    "won't",
+    "would",
+    "wouldn't",
+    "you",
+    "you'd",
+    "you'll",
+    "you're",
+    "you've",
+    "your",
+    "yours",
+    "yourself",
     "yourselves",
 }
 
@@ -241,6 +395,67 @@ def _summarize_python_with_ast(content: str, filepath: Path) -> str:
         return content
 
 
+def _summarize_javascript_with_regex(content: str, filepath: Path) -> str:
+    """
+    Summarizes a JS/TS file by replacing function bodies with a placeholder.
+    Uses a robust method of finding the function start with regex and then
+    programmatically finding the matching closing brace.
+    """
+    # Regex to find various function/method definitions up to the opening brace.
+    # Handles: function name() {, const name = () => {, method() {, etc.
+    function_pattern = re.compile(
+        r"""
+        (
+            (?:async\s+)?function\s*                    # async function
+            (?:[\w\$]+\s*)?                              # Optional function name
+            \([^)]*\)\s*                                # Arguments
+            \{                                          # Opening brace
+        )
+        |
+        (
+            (?:const|let|var)\s+[\w\$]+\s*=\s*          # Variable declaration
+            (?:async\s*)?                               # Optional async
+            \([^)]*\)\s*=>\s*                           # Arrow function arguments
+            \{                                          # Opening brace
+        )
+        |
+        (
+            (?:async\s+|get\s+|set\s+)?                 # Optional async, get, set
+            [\w\$]+\s*                                  # Method name
+            \([^)]*\)\s*                                # Arguments
+            \{                                          # Opening brace
+        )
+        """,
+        re.VERBOSE | re.MULTILINE,
+    )
+
+    # Find all function starts and process them in reverse to avoid index shifting.
+    matches = list(function_pattern.finditer(content))
+    for match in reversed(matches):
+        start_brace_pos = match.end() - 1
+        brace_level = 1
+        end_brace_pos = -1
+
+        # Programmatically find the matching closing brace
+        for i in range(start_brace_pos + 1, len(content)):
+            if content[i] == "{":
+                brace_level += 1
+            elif content[i] == "}":
+                brace_level -= 1
+                if brace_level == 0:
+                    end_brace_pos = i
+                    break
+
+        if end_brace_pos != -1:
+            # Replace the content between the braces
+            body_start = start_brace_pos + 1
+            body_end = end_brace_pos
+            placeholder = " /* ... body omitted ... */ "
+            content = content[:body_start] + placeholder + content[body_end:]
+
+    return content
+
+
 # ---------- Token Shrinking (Robust Implementation) ----------
 def _shrink_tokens(content: str, ext: str) -> str:
     """
@@ -253,7 +468,7 @@ def _shrink_tokens(content: str, ext: str) -> str:
         return content
 
     # Safely create the pattern for matching triple-double-quoted strings to avoid SyntaxError
-    triple_double_quote_pattern = 'f?r?b?u?' + '"""' + '.*?' + '"""'
+    triple_double_quote_pattern = "f?r?b?u?" + '"""' + ".*?" + '"""'
 
     # Use an f-string to inject the safe pattern into the main regex.
     # This avoids the parser error while keeping the regex readable.
@@ -368,15 +583,19 @@ def process_file_content(
 
     filename, ext = filepath.name, filepath.suffix.lower()
 
-    # Apply token shrinking if enabled and file type is supported
-    if args.shrink and ext in SHRINK_EXTENSIONS:
-        content = _shrink_tokens(content, ext)
-
+    # FIX: Swapped order of summarization and shrinking.
+    # Summarization must happen FIRST on valid code, then shrinking can be applied.
     if args.summarize:
         if filename in SUMMARIZE_FILES:
             content = SUMMARIZE_FILES[filename](content)
         elif ext == ".py":
             content = _summarize_python_with_ast(content, filepath)
+        elif ext in {".js", ".jsx", ".ts", ".tsx"}:
+            content = _summarize_javascript_with_regex(content, filepath)
+
+    # Apply token shrinking if enabled and file type is supported
+    if args.shrink and ext in SHRINK_EXTENSIONS:
+        content = _shrink_tokens(content, ext)
 
     if args.strip_prose and ext in CONFIG["DOCS_EXTENSIONS"]:
         content = _strip_prose_simplified(content)
@@ -503,7 +722,7 @@ def _parse_context_ignore(root_path: Path) -> Dict[str, Any]:
 def _should_exclude(
     path: Path,
     args: argparse.Namespace,
-    output_abs_path: Path,
+    output_abs_path: Optional[Path],
     include_exts: Set[str],
     file_ignore_patterns: List[str],
 ) -> bool:
@@ -545,7 +764,7 @@ def _should_exclude(
 def discover_files(
     path: Path,
     args: argparse.Namespace,
-    output_abs_path: Path,
+    output_abs_path: Optional[Path],
     include_exts: Set[str],
     file_ignore_patterns: List[str],
 ) -> List[Path]:
@@ -658,8 +877,8 @@ def main(args: argparse.Namespace):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
-            "v15.4: Consolidate project folder into a single text file. "
-            "Supports .contextignore, tree view, summarization, compression, "
+            "v16.1: Consolidate project folder into a single text file. "
+            "Supports .contextignore, tree view, summarization (py, js, ts), compression, "
             "and robust token shrinking for AI context optimization."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -701,7 +920,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--summarize",
         action="store_true",
-        help="Summarize structure instead of full code.",
+        help="Summarize structure instead of full code (supports py, js, ts).",
     )
     parser.add_argument(
         "--strip-prose",
